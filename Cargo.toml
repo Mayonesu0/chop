@@ -1,0 +1,13 @@
+[package]
+name = "chop-horizon"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Chop!: tree felling with a physical fall, as a Horizon native mod. The rules, standalone, for tests."
+
+# The same file the bundle adds to the game as `game::chop_core`.
+[lib]
+path = "mixins/chop/core.rs"
+
+[dependencies]

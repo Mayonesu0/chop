@@ -1,0 +1,131 @@
+Chop! Licence 1.0 (SPDX: LicenseRef-Chop-1.0)
+
+Copyright (c) 2026 Mayonesu0 (https://github.com/Mayonesu0). All rights reserved,
+except the permissions written below.
+
+"Chop!" means the mod of that name: its source code, its files, its texts and images,
+and every version of them, published at https://github.com/Mayonesu0/chop or through
+Horizon's mod registry.
+
+The source code of Chop! is public so that players and Horizon's reviewers can see what
+it does. That does not make it free software: you may read it, but you may not copy it,
+change it or reuse it except as written here.
+
+1. Players
+
+   You may download Chop! from Horizon's mod registry, from the Horizon launcher or from
+   the repository above, and use it unchanged:
+   - have the Horizon launcher (or `horizon-launcher native-build`) compile it into
+     Horizon, the way the launcher builds every native mod;
+   - play with it in single player, on LAN and on servers you host or run;
+   - share screenshots and videos of it, and talk about it.
+
+2. Horizon's registry
+
+   The Horizon project and the maintainers of its mod registry
+   (https://github.com/horizon-rust/horizon-mods) may store, mirror and distribute
+   unchanged copies of the files of Chop! that Mayonesu0 submits, list them in the
+   registry's index, show them on its pages and in the launcher, and keep them
+   available, or take them down, as the registry's rules say.
+
+3. Horizon's reviewers
+
+   Horizon's reviewers and maintainers may read the whole source of Chop!, build it,
+   run it and test it to review it, and quote parts of it in their review. This is the
+   written grant asked for by Horizon's mod policy ("Licences reviewers can read").
+
+4. What is not allowed
+
+   Without Mayonesu0's prior written permission, you may not:
+   - copy the source code of Chop!, in whole or in part, into another project;
+   - modify Chop!, or distribute or publish a modified version of it, or a work derived
+     from it;
+   - distribute Chop! anywhere else than through the registry and the repository above,
+     or sell it;
+   - publish another mod under the name "Chop!" or present your work as Chop!;
+   - remove or change this licence or the copyright notice.
+
+   Forking the repository on GitHub, as GitHub's Terms of Service allow, gives you no
+   other right than the ones above.
+
+5. No warranty
+
+   Chop! is provided "as is", without warranty of any kind, express or implied. In no
+   event shall Mayonesu0 be liable for any claim, damages or other liability arising
+   from Chop! or from its use.
+
+6. End of the permissions
+
+   Anyone who breaks this licence loses the permissions it gives them.
+
+To ask for a permission, open an issue on https://github.com/Mayonesu0/chop.
+
+Chop! is not an official Minecraft product, and is not approved by or associated with
+Mojang or Microsoft. Horizon is a separate project, under its own licence.
+
+-------------------------------------------------------------------------------------
+
+Licence Chop! 1.0 (traduction française ; en cas de différence, le texte anglais ci-dessus
+fait foi)
+
+Copyright (c) 2026 Mayonesu0 (https://github.com/Mayonesu0). Tous droits réservés, sauf les
+autorisations écrites ci-dessous.
+
+« Chop! » désigne le mod de ce nom : son code source, ses fichiers, ses textes et images, et
+toutes leurs versions, publiés sur https://github.com/Mayonesu0/chop ou par le registre de
+mods d'Horizon.
+
+Le code source de Chop! est public pour que les joueurs et les relecteurs d'Horizon puissent
+voir ce qu'il fait. Ce n'est pas pour autant un logiciel libre : tu peux le lire, mais pas le
+copier, le modifier ni le réutiliser, sauf ce qui est écrit ici.
+
+1. Les joueurs
+
+   Tu peux télécharger Chop! depuis le registre de mods d'Horizon, depuis le launcher Horizon ou
+   depuis le dépôt ci-dessus, et l'utiliser sans le modifier :
+   - le faire compiler dans Horizon par le launcher (ou `horizon-launcher native-build`), comme
+     le launcher le fait pour tout mod natif ;
+   - jouer avec en solo, en LAN et sur les serveurs que tu héberges ;
+   - partager des captures et des vidéos, et en parler.
+
+2. Le registre d'Horizon
+
+   Le projet Horizon et les mainteneurs de son registre de mods
+   (https://github.com/horizon-rust/horizon-mods) peuvent stocker, copier et distribuer sans
+   modification les fichiers de Chop! que Mayonesu0 soumet, les inscrire dans l'index du
+   registre, les montrer sur ses pages et dans le launcher, et les garder disponibles, ou les
+   retirer, selon les règles du registre.
+
+3. Les relecteurs d'Horizon
+
+   Les relecteurs et mainteneurs d'Horizon peuvent lire tout le code source de Chop!, le
+   compiler, l'exécuter et le tester pour le relire, et en citer des parties dans leur relecture.
+   C'est l'autorisation écrite que demande la politique des mods d'Horizon (« Licences reviewers
+   can read »).
+
+4. Ce qui est interdit
+
+   Sans l'autorisation écrite préalable de Mayonesu0, tu ne peux pas :
+   - copier le code source de Chop!, en tout ou en partie, dans un autre projet ;
+   - modifier Chop!, ni distribuer ou publier une version modifiée ou une œuvre dérivée ;
+   - distribuer Chop! ailleurs que par le registre et le dépôt ci-dessus, ni le vendre ;
+   - publier un autre mod sous le nom « Chop! » ou présenter ton travail comme étant Chop! ;
+   - retirer ou modifier cette licence ou la mention de copyright.
+
+   Créer un fork du dépôt sur GitHub, comme les conditions d'utilisation de GitHub le
+   permettent, ne donne aucun autre droit que ceux ci-dessus.
+
+5. Aucune garantie
+
+   Chop! est fourni « tel quel », sans garantie d'aucune sorte, expresse ou implicite.
+   Mayonesu0 ne pourra en aucun cas être tenu responsable d'une réclamation, d'un dommage ou
+   d'une autre responsabilité découlant de Chop! ou de son utilisation.
+
+6. Fin des autorisations
+
+   Quiconque enfreint cette licence perd les autorisations qu'elle lui donne.
+
+Pour demander une autorisation, ouvre une issue sur https://github.com/Mayonesu0/chop.
+
+Chop! n'est pas un produit officiel Minecraft, et n'est ni approuvé par Mojang ou Microsoft,
+ni associé à eux. Horizon est un projet séparé, sous sa propre licence.
