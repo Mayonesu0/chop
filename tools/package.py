@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Writes target/chop-<version>.hnmod, the file Horizon's registry and launcher take.
 
-It holds horizon-native.json (made from compatibility.json), the bundle's .rs and .toml files, and LICENSE as
-mixins/chop/LICENSE, so the licence travels with the sources. Pinned mod: no `hooks`, the launcher builds it on
+It holds horizon-native.json (made from compatibility.json) and the bundle's .rs and .toml files, each of which
+starts with the copyright notice. LICENSE stays in the repository: the registry's checker refuses any other file in
+a native bundle. Pinned mod: no `hooks`, the launcher builds it on
 the Horizon commit compatibility.json names. The archive is reproducible (sorted entries, fixed dates and modes):
 the same sources always give the same bytes and the same SHA-256. Run from anywhere: python3 tools/package.py
 """
@@ -41,7 +42,6 @@ def main() -> int:
     for path in sorted(bundle.rglob("*")):
         if path.is_file() and path.suffix in (".rs", ".toml"):
             files[f"mixins/{mod['id']}/{path.relative_to(bundle).as_posix()}"] = path.read_bytes()
-    files[f"mixins/{mod['id']}/LICENSE"] = (ROOT / "LICENSE").read_bytes()
     out = ROOT / "target" / f"{mod['id']}-{mod['version']}.hnmod"
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:

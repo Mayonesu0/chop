@@ -1,3 +1,5 @@
+// Chop! (c) 2026 Mayonesu0. All rights reserved, except the grants in LICENSE: https://github.com/Mayonesu0/chop/blob/main/LICENSE
+
 // Chop! — the rules (game::chop_core).
 //
 // Which blocks make the tree, which way it falls, how it moves and what it hits.

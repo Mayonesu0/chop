@@ -99,7 +99,7 @@ needs `sudo apt install build-essential pkg-config libasound2-dev libudev-dev` (
 
 1. In the launcher, **Mods** page, pick the instance and **Open folder** (or open the instance's
    `horizon-native-mods/` folder yourself, next to its `options.txt`).
-2. Copy `chop-1.0.0.hnmod` into `horizon-native-mods/` (and remove any older version).
+2. Copy `chop-1.0.1.hnmod` into `horizon-native-mods/` (and remove any older version).
 3. Turn it on with its switch on the Mods page, or add the line `mod.chop:true` to `horizon-mods.txt`.
 4. On the **Native build** row, click **Build**, then "I trust these mods: build". The first build
    takes 20 to 30 minutes.
@@ -227,7 +227,7 @@ checked), the fatigue's size, and play with several players.
 
 ```sh
 cargo test                     # the rules, without Horizon
-python3 tools/package.py       # target/chop-1.0.0.hnmod (reproducible: same sources, same SHA-256)
+python3 tools/package.py       # target/chop-1.0.1.hnmod (reproducible: same sources, same SHA-256)
 ```
 
 ## Licence

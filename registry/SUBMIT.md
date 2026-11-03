@@ -7,16 +7,16 @@ What to put in each field of https://playhorizon.dev/mods/submit (sign in with G
 | Field | Value |
 |---|---|
 | Kind | Native mod |
-| File | `chop-1.0.0.hnmod` (made with `python3 tools/package.py`) |
-| SHA-256 | `e1cf52d3c97ccffd2d51b0a13e237af158e6687eaad0b5834e13dec3196eff84` |
+| File | `chop-1.0.1.hnmod` (made with `python3 tools/package.py`) |
+| SHA-256 | `5abac195c54da7716f35f641489c0dba780444c91b0b3e4f3387ecd4cb2b260b` |
 | Id | `chop` |
-| Version | `1.0.0` |
+| Version | `1.0.1` |
 | Minecraft version | `26.3` |
 
 What changed:
 
 ```
-First release. Pinned to Horizon Nightly 2026-11-01 (c9d474d) and Horizon Mixins ddd9700; the launcher builds those exact revisions.
+First release (1.0.0 was never published: its package carried a LICENSE file the registry's checker refuses; the code is the same). Pinned to Horizon Nightly 2026-11-01 (c9d474d) and Horizon Mixins ddd9700; the launcher builds those exact revisions.
 ```
 
 ## Its page
@@ -27,7 +27,7 @@ First release. Pinned to Horizon Nightly 2026-11-01 (c9d474d) and Horizon Mixins
 | Authors | `Mayonesu0` |
 | Licence | `LicenseRef-Chop-1.0` |
 | Source | `https://github.com/Mayonesu0/chop` |
-| Icon | `registry/icon.png` (256×256, 2 KiB) |
+| Icon | the file `registry/icon.png` (256×256, 2 KiB), or as a link: `https://raw.githubusercontent.com/Mayonesu0/chop/main/registry/icon.png` (a `github.com/…/blob/…` link is a web page, not the image) |
 
 One-line summary:
 
@@ -68,11 +68,11 @@ minisign -G -p horizon-mods.pub -s horizon-mods.key
 Sign the file:
 
 ```sh
-minisign -S -s horizon-mods.key -m chop-1.0.0.hnmod
+minisign -S -s horizon-mods.key -m chop-1.0.1.hnmod
 ```
 
 In the form: the public key is the last line of `horizon-mods.pub` (it starts with `RW`), and the signature is
-`chop-1.0.0.hnmod.minisig`.
+`chop-1.0.1.hnmod.minisig`.
 
 ## Comment on the pull request
 
@@ -81,6 +81,8 @@ MIT, Apache-2.0 and the like comes with a written grant for the reviewers, named
 comment on it:
 
 ```markdown
+This replaces #192 (Chop! 1.0.0), which can be closed: its package carried `mixins/chop/LICENSE`, which the checker refused. 1.0.1 has the same code, with the copyright notice as a comment at the top of each source file instead.
+
 Licence: `LicenseRef-Chop-1.0`, all rights reserved with written grants. Its section 3 lets Horizon's reviewers and maintainers read, build, run and test the whole source to review it, and section 2 lets the registry store and distribute unchanged copies: https://github.com/Mayonesu0/chop/blob/main/LICENSE
 
 Chop! is pinned to Horizon c9d474d (Nightly 2026-11-01) and Horizon Mixins ddd9700, because it uses some of the game's own state besides the native hook points (block loot, item spawning, mobs, the LAN hub's sound and particle queues). It was applied with horizon-mixins ddd9700, built with the launcher's `fast` profile and tested in the game on that commit; `cargo horizon-mod check` passes. It does not build on Nightly 2026-11-03 (f42ef42) yet, for a reason outside the mod: horizon-mixins ddd9700 rejects that commit's new `#![recursion_limit = "256"]` in `crates/horizon-client/src/lib.rs` (E_UNSUPPORTED_MACRO), and Horizon's own Zoom fails the same way there.

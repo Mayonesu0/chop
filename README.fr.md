@@ -122,7 +122,7 @@ mods natifs demande : `sudo apt install build-essential pkg-config libasound2-de
 
 1. Dans le launcher, page **Mods**, choisis l'instance puis **Open folder** (ou ouvre toi-même le dossier
    `horizon-native-mods/` du dossier de jeu de l'instance, celui qui contient `options.txt`).
-2. Copie `chop-1.0.0.hnmod` dans `horizon-native-mods/` (et retire l'ancienne version s'il y en a une).
+2. Copie `chop-1.0.1.hnmod` dans `horizon-native-mods/` (et retire l'ancienne version s'il y en a une).
 3. Active-le avec son interrupteur sur la page Mods, ou ajoute la ligne `mod.chop:true` dans
    `horizon-mods.txt`.
 4. Sur la ligne **Native build**, clique **Build**, puis « I trust these mods: build ». La première
@@ -264,7 +264,7 @@ du launcher, et le `.hnmod` est accepté par le lecteur de bundles du launcher.
 
 ```sh
 cargo test                     # les règles, sans Horizon
-python3 tools/package.py       # target/chop-1.0.0.hnmod
+python3 tools/package.py       # target/chop-1.0.1.hnmod
 ```
 
 ## Licence

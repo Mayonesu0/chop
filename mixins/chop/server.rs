@@ -1,3 +1,5 @@
+// Chop! (c) 2026 Mayonesu0. All rights reserved, except the grants in LICENSE: https://github.com/Mayonesu0/chop/blob/main/LICENSE
+
 // Chop! — the game's side (game::chop_server).
 //
 // A player cuts a log: on the next tick of that level the tree is read
