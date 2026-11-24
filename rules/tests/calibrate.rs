@@ -1,5 +1,5 @@
-// cargo test --test calibrate -- --ignored --nocapture
-use chop_horizon::*;
+// cargo test --manifest-path rules/Cargo.toml --test calibrate -- --ignored --nocapture
+use chop_rules::*;
 use std::collections::HashMap;
 
 struct W(HashMap<Pos, Cell>);

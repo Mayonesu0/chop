@@ -1,0 +1,24 @@
+# Chop! (c) 2026 Mayonesu0. All rights reserved, except the grants in LICENSE: https://github.com/Mayonesu0/chop/blob/main/LICENSE
+
+id = "chop"
+name = "Chop!"
+version = "1.1.0"
+description = "Cut one log and the whole tree tips over, crashes down and breaks apart, with soft vanilla sounds and particles."
+authors = ["Mayonesu0"]
+license = "LicenseRef-Chop-1.0"
+license_url = "https://github.com/Mayonesu0/chop/blob/main/LICENSE"
+homepage = "https://github.com/Mayonesu0/chop"
+issues = "https://github.com/Mayonesu0/chop/issues"
+api = "0.2"
+# Only the server needs it: in single player and on a LAN host it runs in the integrated server,
+# and players who join install nothing.
+side = "server"
+capabilities = ["registries"]
+
+# The build it is made for: Horizon Nightly 2026-11-22 (f1bb66f) and the horizon-mixins commit that
+# build pins. It uses the mod API alone (no [native.*] table, no internals), so the launcher also
+# builds it on later builds where nothing it uses changed (`cargo horizon-mod fits`).
+[native]
+game = "26.3"
+horizon = "f1bb66f353cf67f2aa4665293fc75c8d91186fc7"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

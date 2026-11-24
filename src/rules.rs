@@ -1,11 +1,11 @@
 // Chop! (c) 2026 Mayonesu0. All rights reserved, except the grants in LICENSE: https://github.com/Mayonesu0/chop/blob/main/LICENSE
 
-// Chop! — the rules (game::chop_core).
+// Chop! — the rules (crate::rules).
 //
 // Which blocks make the tree, which way it falls, how it moves and what it hits.
-// Nothing here knows Horizon: the game's side (game::chop_server) reads the level
-// through `World` and carries out what these functions decide, and the tests run
-// them on worlds built by hand.
+// Nothing here knows Horizon: the game's side (crate::game) reads the level
+// through `World` and carries out what these functions decide, and the tests
+// (rules/tests/) run them on worlds built by hand.
 //
 // A felling: the cut block shakes and pops; the trunk drops into the gap it left,
 // then turns about the front edge of its base under gravity as one rigid body. It
