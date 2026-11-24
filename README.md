@@ -3,13 +3,15 @@
 **English** · [Français](README.fr.md)
 
 **Cut one log with an axe: the whole tree tips over, crashes to the ground and breaks apart.**
-A native Rust mod for [Horizon](https://github.com/horizon-rust/horizon) (Minecraft: Java Edition 26.3).
+A native Rust mod for [Horizon](https://github.com/horizon-rust/horizon) (Minecraft: Java Edition 26.3),
+written on Horizon's mod API alone.
 
 ## What it does
 
-- **The log shakes while you cut it**: while you mine the log, it trembles and swells more and more,
-  with little knocks, wood chips and a few leaves falling from the crown. When it gives way it swells
-  one last time and pops in a small cloud. An axe that cuts the log in one hit pops it at once.
+- **The log shakes while you cut it**: as the crack in the log grows, it trembles and swells more and
+  more, with little knocks, wood chips and a few leaves falling from the crown. When it gives way it
+  swells one last time and pops in a small cloud. An axe that cuts the log almost at once pops it
+  straight away.
 - **The fall**: the trunk first drops into the gap the log left and lands on the stump. The fibres
   crack, the trunk creaks, then gravity tips it over, like a rigid body pivoting on the front edge of
   its base. It starts slowly, speeds up, and stops where its **trunk** meets the ground or an obstacle:
@@ -57,10 +59,12 @@ A native Rust mod for [Horizon](https://github.com/horizon-rust/horizon) (Minecr
 - **Giant mushrooms and Nether trees**: huge red and brown mushrooms and huge crimson and warped fungi
   fall like trees (stems, caps, wart blocks, shroomlights, vines), and are replanted as a mushroom or a
   fungus.
-- **Angry bees**: a nest that falls without Silk Touch releases its bees, angry, as in vanilla.
+- **Angry bees**: a nest that falls without Silk Touch releases its bees, angry: it is broken as the
+  lumberjack breaks it, by vanilla's own rules.
 - **Birds and apples**: when a big tree starts to tip, birds fly off the crown, chirping. Apples drop
   during the fall.
-- **Biome colours**: twirling leaves take the biome's tint (oak, jungle, acacia, dark oak).
+- **Biome colours**: twirling leaves take the biome's tint (oak, jungle, acacia, dark oak) in the biomes
+  where those trees grow (see [Known limits](#known-limits)).
 - **Lumberjack fatigue** (off by default): felling a tree makes you a little hungry.
 - **Personal settings**: each player picks their own volume, particles and preview with `/chop perso`.
 - **Stats**: `/chop stats` shows your felled trees, your record and the world's ranking.
@@ -73,53 +77,69 @@ For players and reviewers, in plain words:
 - **No network access**, no downloads, no telemetry. It never runs a program.
 - **One file**: it reads and writes only `<world>/data/chop.txt` (changed settings, personal settings,
   stats, players who turned Chop! off, positions of logs placed by players). Nothing else on disk.
-- **Only vanilla sounds and particles**, sent through the game's own queues. No resource pack.
-- **Server-side**: it runs where the world runs (single player's server thread, LAN host, Horizon
-  dedicated server). Players who join, Horizon or vanilla, install nothing.
-- To act on the world it calls the game's own functions, and runs a few **vanilla commands** as the
-  server (never as a player):
+- **Only vanilla sounds and particles**, sent through the mod API. No resource pack.
+- **Server-side** (`side = "server"`): it runs where the world runs (single player's server thread, LAN
+  host, Horizon dedicated server). Players who join, Horizon or vanilla, install nothing.
+- **Horizon's mod API only**: it patches nothing in the game (no mixin, no internals). To act on the
+  world it calls the API's functions (blocks, loot, items, entities, displays, sounds, particles), and
+  runs a few **vanilla commands** as the server (never as a player), each in the tree's dimension
+  (`execute in <dimension> run …`):
   - `kill @e[type=minecraft:block_display,tag=chop.…]`: removes its own falling-tree displays (only
     entities tagged by Chop!);
   - `item modify entity <player> weapon.mainhand …`: applies the axe's wear for the whole tree;
   - `damage <player> … minecraft:falling_block`: hurts a player the tree hits (off by default);
-  - `summon minecraft:item` and `setblock … <sapling> keep`: drops loot and replants a sapling when the
-    tree is in another dimension than the one being ticked.
+  - `playsound … <player>` and `particle … normal <player>`: a sound or particles for one player, when
+    the players nearby don't all have the same personal settings (otherwise it is one sound, or one
+    send, for everyone near it);
+  - `summon minecraft:item` and `setblock … <sapling> keep`: drops loot and replants a sapling when a
+    tree has to end while its dimension isn't ticking (everyone left it, or the server stops).
 - It only touches trees (logs, leaves, giant mushrooms, Nether fungi and what hangs on them), the
   sapling it replants, its own display entities, and the entities a falling tree hits.
 
 ## Install
 
 The easy way: in the Horizon launcher, **Mods** page, search for **Chop!**, install it, then **Build**
-("I trust these mods: build"). The launcher compiles it on the Nightly it was made for, on its own.
+("I trust these mods: build").
 
-By hand, with the `.hnmod` file:
+Straight from this repository (for a version not yet in the registry): on the Mods page, **Add from
+GitHub** with `https://github.com/Mayonesu0/chop`, or from the command line:
+
+```sh
+horizon-launcher mods add-github https://github.com/Mayonesu0/chop --trust-native-code
+```
+
+By hand, with the `.hmod` file:
 
 You need the **Horizon launcher** (Linux, macOS Apple Silicon or Windows). On Linux, building native mods
-needs `sudo apt install build-essential pkg-config libasound2-dev libudev-dev` (Debian/Ubuntu/Mint).
+may need `sudo apt install build-essential pkg-config libasound2-dev libudev-dev` (Debian/Ubuntu/Mint).
 
-1. In the launcher, **Mods** page, pick the instance and **Open folder** (or open the instance's
+1. Make the package in this folder with Horizon's mod tool: `cargo horizon-mod build` writes
+   `target/horizon-mod/chop.hmod` (the tool: `cargo install --locked --git
+   https://github.com/horizon-rust/horizon cargo-horizon-mod`).
+2. In the launcher, **Mods** page, pick the instance and **Open folder** (or open the instance's
    `horizon-native-mods/` folder yourself, next to its `options.txt`).
-2. Copy `chop-1.0.1.hnmod` into `horizon-native-mods/` (and remove any older version).
-3. Turn it on with its switch on the Mods page, or add the line `mod.chop:true` to `horizon-mods.txt`.
-4. On the **Native build** row, click **Build**, then "I trust these mods: build". The first build
-   takes 20 to 30 minutes.
-5. Start the instance and check in **Options > Mods** that Chop! is on.
+3. Copy `chop.hmod` into `horizon-native-mods/`, and remove any older `chop-*.hnmod`: the launcher refuses
+   the old format.
+4. Turn it on with its switch on the Mods page, or add the line `mod.chop:true` to `horizon-mods.txt`.
+5. On the **Native build** row, click **Build**, then "I trust these mods: build". The game is prebuilt:
+   the launcher fetches the build's SDK the first time (a few hundred MB) and compiles Chop! against it.
+6. Start the instance and check in **Options > Mods** that Chop! is on.
 
 If you have another tree-felling mod, turn it off: both mods would fell the same tree.
 
-From the command line, in the unpacked source folder (the one with `horizon-mixin.toml`):
+From the command line, in this folder (the one with `horizon-mod.toml`):
 
 ```sh
-horizon-launcher native-build /path/to/chop/mixins/chop --instance "Horizon" --trust-native-code
+horizon-launcher native-build . --instance "Horizon" --trust-native-code
 ```
 
-Chop! is **pinned to Horizon Nightly 2026-11-01** (`c9d474d`): it uses some of the game's internal
-functions (a block's loot, dropped items, mobs, the sound and particle queues), so the launcher always
-builds it on that commit, even if you play a newer Nightly. New versions of Chop! will follow the
-Nightlies.
+**Which Nightly.** Chop! 1.1.0 is made for **Horizon Nightly 2026-11-22** (`f1bb66f`). It uses only the
+mod API, and its package lists what it uses (`uses.json`), so the launcher also builds it on a later
+Nightly where none of that changed (`cargo horizon-mod fits` tells you). When a Nightly changes something
+Chop! uses, the launcher leaves it out of that build and names what changed, until a new version follows.
 
-On a Horizon **dedicated server**: `horizon-launcher native-build <folder> --server-output
-<server-folder>`. Players (Horizon or vanilla) install nothing.
+On a Horizon **dedicated server**: `horizon-launcher native-build <folder> --server-output <server-folder>
+--version <tag> --trust-native-code`. Players (Horizon or vanilla) install nothing.
 
 ## Use
 
@@ -191,9 +211,20 @@ world's setting.
 
 ## What was checked
 
-**In the real game.** Horizon was run without a window, with software rendering, on Nightly `c9d474d`
-with the real Minecraft 26.3 data. A player was driven through Horizon's agent control: it mines logs as
-a player does, and screenshots were taken. Seen and measured:
+**Version 1.1.0** rewrites the game side (`src/game.rs`, `src/lib.rs`) for Horizon's mod API; the rules
+(`src/rules.rs`) are unchanged.
+
+- The rules pass their 18 tests on hand-built worlds (`cargo test --manifest-path rules/Cargo.toml`).
+- Every hook, event, method, type and import the game side uses was compared with the source of the
+  pinned SDK (the signed release `sdk-f1bb66f…`): they all match. It also compiles, with no clippy
+  warning, against a small copy of those declarations.
+- **Not checked yet**: a real compile against the SDK (`cargo horizon-mod check`; the API's own crates.io
+  dependencies couldn't be fetched where this was written), and playing it in the game. Until then,
+  treat 1.1.0 as untested.
+
+**Version 1.0.1, in the real game.** Horizon was run without a window, with software rendering, on
+Nightly `c9d474d` with the real Minecraft 26.3 data. A player was driven through Horizon's agent control:
+it mines logs as a player does, and screenshots were taken. Seen and measured:
 
 - An oak in survival: the log shakes while being cut; the tree tips toward where the player looks,
   lies down, breaks up from the base to the top with clouds, sparkles and hearts; every display is
@@ -209,26 +240,47 @@ a player does, and screenshots were taken. Seen and measured:
 - `/chop stats`, `/chop perso` and the `/chop config` menu work in the chat, buttons included.
 - The particles of the preview, birds, sparkles, hearts and impact dust reach the player.
 
-**Outside the game.** The rules (`mixins/chop/core.rs`) pass 18 tests on hand-built worlds. The bundle
-applies with the launcher's horizon-mixins, the modded game builds completely with the launcher's `fast`
-profile, and the `.hnmod` passes `cargo horizon-mod check`.
+**Version 1.0.1, outside the game.** The rules passed the same 18 tests; the bundle applied with the
+launcher's horizon-mixins, the modded game built with the launcher's `fast` profile, and the `.hnmod`
+passed `cargo horizon-mod check`.
 
-**Not checked**: the sound output itself (the test game had no audio device; only the sending was
+**Never checked**: the sound output itself (the test game had no audio device; only the sending was
 checked), the fatigue's size, and play with several players.
 
 ## Known limits
 
 - During the fall, the tree's leaves have the game's default colour, not the biome's: the game draws
   display blocks that way.
+- Twirling leaves take the biome's tint in plains, forests (flower and dark forests included), jungles,
+  savannas, swamps (mangrove swamps included), badlands and on beaches. Elsewhere, and in biomes added by
+  data packs or mods, they keep the leaves' usual colour: the server doesn't know the biome colour map.
 - The whole falling tree is lit like the cut block.
+- The log starts shaking at the dig's first crack: a log cut in a blow or two doesn't shake.
+- A falling bee nest releases its bees when its lumberjack is in survival or adventure, in the tree's
+  dimension. In creative mode its bees stay in, as with vanilla's creative break.
 - Shaking a tree doesn't give much: on purpose, so it isn't a farm.
 
 ## Build
 
 ```sh
-cargo test                     # the rules, without Horizon
-python3 tools/package.py       # target/chop-1.0.1.hnmod (reproducible: same sources, same SHA-256)
+cargo horizon-mod check                       # package rules, cargo check against the pinned SDK, what Chop! uses
+cargo horizon-mod build                       # target/horizon-mod/chop.hmod, with its uses.json
+cargo horizon-mod fits                        # whether it fits the current Nightly
+cargo test --manifest-path rules/Cargo.toml   # the rules, without Horizon
 ```
+
+The first `cargo horizon-mod` command fetches the pinned SDK into `.horizon/`, which is neither in the
+repository nor in the package.
+
+| Path | What |
+|---|---|
+| `horizon-mod.toml` | The manifest: id, version, the build it is made for |
+| `src/lib.rs` | The hooks: each moment of the game Chop! listens to |
+| `src/game.rs` | The game side: reads and changes the world through the mod API |
+| `src/rules.rs` | The rules: the tree, its fall, the physics, the settings (no Horizon) |
+| `rules/` | A small crate that tests the rules alone (not in the package) |
+| `icon.png` | The icon the launcher and the game's Mods screen show |
+| `registry/` | The registry page and its icon |
 
 ## Licence
 

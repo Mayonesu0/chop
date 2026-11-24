@@ -1,6 +1,6 @@
 // The rules on worlds built by hand.
 
-use chop_horizon::*;
+use chop_rules::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const GROUND: i32 = 64;

@@ -1,13 +1,13 @@
-[package]
-name = "chop-horizon"
-version = "1.0.1"
-edition = "2024"
-rust-version = "1.88"
-publish = false
-description = "Chop!: tree felling with a physical fall, as a Horizon native mod. The rules, standalone, for tests."
+# Chop! (c) 2026 Mayonesu0. All rights reserved, except the grants in LICENSE: https://github.com/Mayonesu0/chop/blob/main/LICENSE
 
-# The same file the bundle adds to the game as `game::chop_core`.
-[lib]
-path = "mixins/chop/core.rs"
+# The mod's crate. Its id and version are horizon-mod.toml's, not these.
+[package]
+name = "mod-chop"
+version = "1.1.0"
+edition = "2024"
+publish = false
 
 [dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command (the
+# launcher builds against its own copy of the same build). Chop! has no other dependency.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }

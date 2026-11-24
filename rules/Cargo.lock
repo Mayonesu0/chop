@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "chop-horizon"
-version = "1.0.1"
+name = "chop-rules"
+version = "1.1.0"

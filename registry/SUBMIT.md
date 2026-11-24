@@ -7,16 +7,19 @@ What to put in each field of https://playhorizon.dev/mods/submit (sign in with G
 | Field | Value |
 |---|---|
 | Kind | Native mod |
-| File | `chop-1.0.1.hnmod` (made with `python3 tools/package.py`) |
-| SHA-256 | `5abac195c54da7716f35f641489c0dba780444c91b0b3e4f3387ecd4cb2b260b` |
+| File | `target/horizon-mod/chop.hmod` (made with `cargo horizon-mod build`, which also packs its `uses.json`) |
+| SHA-256 | the line `sha256sum target/horizon-mod/chop.hmod` prints (`Get-FileHash` on Windows) |
 | Id | `chop` |
-| Version | `1.0.1` |
+| Version | `1.1.0` |
 | Minecraft version | `26.3` |
+
+Before submitting, build it and try it in the game: `cargo horizon-mod check` must pass, and the
+comment below says it was tested.
 
 What changed:
 
 ```
-First release (1.0.0 was never published: its package carried a LICENSE file the registry's checker refuses; the code is the same). Pinned to Horizon Nightly 2026-11-01 (c9d474d) and Horizon Mixins ddd9700; the launcher builds those exact revisions.
+Rewritten on Horizon's mod API: no mixin and no game internals any more. Made for Horizon Nightly 2026-11-22 (f1bb66f); the launcher also builds it on later Nightlies where nothing it uses has changed. Same features and settings. The log now shakes as the dig's crack grows; a falling bee nest is broken as its lumberjack breaks it, by vanilla's own rules. The package now carries LICENSE and the READMEs.
 ```
 
 ## Its page
@@ -50,9 +53,9 @@ Cut one log with an axe: the whole tree tips over like a real falling tree, cras
 - Vanilla loot (Fortune, Silk Touch), honest axe wear, fall preview, shaking trees with an empty hand, giant mushrooms and Nether fungi, angry bees, birds, apples, biome-tinted leaves, optional loot into your inventory.
 - **Everything is configurable in game**, with commands or by clicking in the chat: `/chop config` (operators), `/chop perso` (each player's sounds, particles and preview), `/chop stats`, `/chop aide`. The menus are in French.
 
-**What it does and doesn't do.** It runs server-side, where the world runs: players who join install nothing. No network access, no telemetry, never runs a program. It reads and writes one file, `<world>/data/chop.txt` (settings, stats, player-placed logs). It only touches trees, the sapling it replants, its own `block_display` entities and what a falling tree hits. Besides the game's functions, it runs a few vanilla commands as the server: `kill` on its own tagged displays, `item modify` for the axe's wear, `damage` on a player the tree hits (off by default), and `summon item` / `setblock … keep` for loot and replanting when the tree is in another dimension.
+**What it does and doesn't do.** It runs server-side, where the world runs: players who join install nothing. No network access, no telemetry, never runs a program. It reads and writes one file, `<world>/data/chop.txt` (settings, stats, player-placed logs). It only touches trees, the sapling it replants, its own `block_display` entities and what a falling tree hits. It uses Horizon's mod API alone (no mixin, no game internals), and runs a few vanilla commands as the server: `kill` on its own tagged displays, `item modify` for the axe's wear, `damage` on a player the tree hits (off by default), `playsound` / `particle` for one player when players nearby have different personal settings, and `summon item` / `setblock … keep` for loot and replanting when a tree ends while its dimension isn't ticking.
 
-Native source mod: install it on the launcher's Mods page, press Build there, and confirm the native-code warning. The launcher builds a separate game with it, and it runs with your account's permissions. Each version is pinned to one Horizon Nightly and Horizon Mixins revision, named in its changelog; the launcher builds those exact revisions.
+Native source mod: install it on the launcher's Mods page, press Build there, and confirm the native-code warning. The launcher compiles it against the game build's SDK, and it runs with your account's permissions. Each version is made for one Horizon Nightly, named in its changelog; it uses only the mod API, so the launcher also builds it on later Nightlies where nothing it uses has changed.
 
 Original mod by Mayonesu0. All rights reserved, except the grants in its [LICENSE](https://github.com/Mayonesu0/chop/blob/main/LICENSE): players may use it unchanged, Horizon's registry may distribute it, and Horizon's reviewers may read it to review it.
 ```
@@ -68,11 +71,11 @@ minisign -G -p horizon-mods.pub -s horizon-mods.key
 Sign the file:
 
 ```sh
-minisign -S -s horizon-mods.key -m chop-1.0.1.hnmod
+minisign -S -s horizon-mods.key -m target/horizon-mod/chop.hmod
 ```
 
 In the form: the public key is the last line of `horizon-mods.pub` (it starts with `RW`), and the signature is
-`chop-1.0.1.hnmod.minisig`.
+`target/horizon-mod/chop.hmod.minisig`.
 
 ## Comment on the pull request
 
@@ -81,9 +84,9 @@ MIT, Apache-2.0 and the like comes with a written grant for the reviewers, named
 comment on it:
 
 ```markdown
-This replaces #192 (Chop! 1.0.0), which can be closed: its package carried `mixins/chop/LICENSE`, which the checker refused. 1.0.1 has the same code, with the copyright notice as a comment at the top of each source file instead.
+Chop! 1.1.0, an update of Chop! 1.0.1.
 
 Licence: `LicenseRef-Chop-1.0`, all rights reserved with written grants. Its section 3 lets Horizon's reviewers and maintainers read, build, run and test the whole source to review it, and section 2 lets the registry store and distribute unchanged copies: https://github.com/Mayonesu0/chop/blob/main/LICENSE
 
-Chop! is pinned to Horizon c9d474d (Nightly 2026-11-01) and Horizon Mixins ddd9700, because it uses some of the game's own state besides the native hook points (block loot, item spawning, mobs, the LAN hub's sound and particle queues). It was applied with horizon-mixins ddd9700, built with the launcher's `fast` profile and tested in the game on that commit; `cargo horizon-mod check` passes. It does not build on Nightly 2026-11-03 (f42ef42) yet, for a reason outside the mod: horizon-mixins ddd9700 rejects that commit's new `#![recursion_limit = "256"]` in `crates/horizon-client/src/lib.rs` (E_UNSUPPORTED_MACRO), and Horizon's own Zoom fails the same way there.
+1.1.0 uses Horizon's mod API alone: no `[native.*]` table, no internals, and its package carries `uses.json`. It is made for Horizon f1bb66f (Nightly 2026-11-22). `cargo horizon-mod check` passes, and it was built by the launcher and tested in the game on that Nightly.
 ```

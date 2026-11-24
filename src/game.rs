@@ -1,30 +1,28 @@
 // Chop! (c) 2026 Mayonesu0. All rights reserved, except the grants in LICENSE: https://github.com/Mayonesu0/chop/blob/main/LICENSE
 
-// Chop! — the game's side (game::chop_server).
+// Chop! — the game's side (crate::game).
 //
 // A player cuts a log: on the next tick of that level the tree is read
-// (game::chop_core decides what it is and which way it falls), its loot is rolled
+// (crate::rules decides what it is and which way it falls), its loot is rolled
 // with the player's tool, it leaves the level and comes back as block displays that
-// turn about their hinge under gravity. Each tick every display gets its new pose in
-// one entity-data packet; sounds and particles go straight to the players near it;
-// what a block gives drops where it breaks. `/chop` toggles it per player and opens
-// the settings, a menu of clickable lines in the chat.
+// turn about their hinge under gravity. Each tick every display gets its new pose,
+// eased over one tick; sounds and particles go to the players near it, at their own
+// settings; what a block gives drops where it breaks. `/chop` toggles it per player
+// and opens the settings, a menu of clickable lines in the chat.
+//
+// Everything goes through Horizon's mod API (the host): nothing here reaches into the
+// game's own code.
 
-use super::Game;
-use super::chop_core::{self as core, Cell, Config, Key, Phase, Pos, Section, Unit};
-use super::creatures::NativeSound;
-use super::lan_particles::QueuedParticle;
-use super::native_entities::NativeDisplay;
-use super::native_lifecycle::{ServerTickPhase, WorldPhase};
-use super::native_server::{NativeCommand, NativeServerPlayer};
-use horizon_client::items::ItemStack;
-use horizon_client::mobs::{Damage, DamageKind};
-use horizon_client::particles::{ParticleOptions, ParticleType};
-use horizon_client::text::{ClickEvent, Style, Text, named_color};
-use horizon_protocol::entity_data::{Value, serializer};
-use horizon_protocol::packets::play::{self, Clientbound, SetEntityData};
-use horizon_world::nbt::{Compound, Tag};
-use horizon_world::registry::BlockStateId;
+use crate::rules::{self, Cell, Config, Key, Phase, Pos, Section, Unit};
+use mod_api::text::{TextClick, TextStyle};
+use mod_api::{
+    Authority, BlockClick, BlockMetadata, BlockShapeKind, BlockState, BlockUpdateFlags, Command,
+    CommandArgumentValue, CommandInvocation, CommandSource, Compound, DisplayRef, EntityPlaceEvent,
+    GameMode, GameRuleValue, Hand, Host, HostBlockStates, Identifier, ItemStack, LevelRef,
+    LifecycleContext, LogicalSide, MobCategory, ParticleKey, ParticleOptions, Placement, PlayerRef,
+    Registrar, ServerHost, ServerTickPhase, SoundSource, Tag, Text, TextHover, Transformation,
+    WorldPhase,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -34,10 +32,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const MOD: &str = "chop";
 /// Every display of the mod carries it.
 const TAG: &str = "chop.d";
-/// `Level.setBlock` flags: the client is told, nothing else happens.
-const QUIET: i32 = 2 | 816;
-/// The usual: neighbours and shapes update.
-const NORMAL: i32 = 3;
 /// A cut not looked at by then is dropped (the break was cancelled).
 const PENDING_TICKS: u32 = 40;
 /// A tree whose level hasn't ticked for this long is ended where it is.
@@ -45,8 +39,24 @@ const IDLE_TICKS: u64 = 100;
 const SAVE_TICKS: u64 = 600;
 /// While no tree falls, displays left by a crash are removed this often.
 const SWEEP_TICKS: u64 = 600;
-/// Sound source `block`.
-const BLOCKS: i32 = 4;
+/// A dig whose crack hasn't grown for this long has stopped.
+const DIG_STALL: u32 = 200;
+/// A left click that starts no dig by then (an instant break, creative) shows nothing.
+const DIG_START: u32 = 20;
+
+/// `Level.setBlock` flags: the client is told, nothing else happens.
+fn quiet() -> BlockUpdateFlags {
+    BlockUpdateFlags::CLIENTS
+        | BlockUpdateFlags::KNOWN_SHAPE
+        | BlockUpdateFlags::SUPPRESS_DROPS
+        | BlockUpdateFlags::SKIP_BLOCK_ENTITY_SIDE_EFFECTS
+        | BlockUpdateFlags::SKIP_ON_PLACE
+}
+
+/// The usual: neighbours and shapes update.
+fn normal() -> BlockUpdateFlags {
+    BlockUpdateFlags::NEIGHBORS | BlockUpdateFlags::CLIENTS
+}
 
 /// Mobs that are on the players' side.
 const ALLIES: [&str; 6] = [
@@ -59,6 +69,139 @@ const ALLIES: [&str; 6] = [
 ];
 
 // ---------------------------------------------------------------------------------
+// Particles
+// ---------------------------------------------------------------------------------
+
+/// The particles Chop! sends, as the game resolved them when it loaded.
+#[derive(Clone, Copy)]
+struct Keys {
+    block: ParticleKey,
+    dust: ParticleKey,
+    dust_pillar: ParticleKey,
+    tinted_leaves: ParticleKey,
+    cherry_leaves: ParticleKey,
+    pale_oak_leaves: ParticleKey,
+    crimson_spore: ParticleKey,
+    warped_spore: ParticleKey,
+    poof: ParticleKey,
+    happy_villager: ParticleKey,
+    crit: ParticleKey,
+    heart: ParticleKey,
+    cloud: ParticleKey,
+}
+
+static KEYS: Mutex<Option<Keys>> = Mutex::new(None);
+
+/// `Hooks::register`: the particle types are asked for once, before any world opens.
+pub(crate) fn register(r: &mut dyn Registrar) {
+    let keys = Keys {
+        block: r.particle_key("minecraft:block"),
+        dust: r.particle_key("minecraft:dust"),
+        dust_pillar: r.particle_key("minecraft:dust_pillar"),
+        tinted_leaves: r.particle_key("minecraft:tinted_leaves"),
+        cherry_leaves: r.particle_key("minecraft:cherry_leaves"),
+        pale_oak_leaves: r.particle_key("minecraft:pale_oak_leaves"),
+        crimson_spore: r.particle_key("minecraft:crimson_spore"),
+        warped_spore: r.particle_key("minecraft:warped_spore"),
+        poof: r.particle_key("minecraft:poof"),
+        happy_villager: r.particle_key("minecraft:happy_villager"),
+        crit: r.particle_key("minecraft:crit"),
+        heart: r.particle_key("minecraft:heart"),
+        cloud: r.particle_key("minecraft:cloud"),
+    };
+    *KEYS.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys);
+}
+
+fn keys() -> Option<Keys> {
+    *KEYS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A particle Chop! sends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fx {
+    /// A block's bits (the state goes with it).
+    Block,
+    /// Ground dust rising (the state goes with it).
+    DustPillar,
+    Poof,
+    HappyVillager,
+    Crit,
+    Heart,
+    Cloud,
+    CherryLeaves,
+    PaleOakLeaves,
+    CrimsonSpore,
+    WarpedSpore,
+    /// A falling leaf of this colour (RGB).
+    Leaves(u32),
+    /// Coloured dust: its colour and size.
+    Dust([f32; 3], f32),
+}
+
+impl Fx {
+    fn options(self, k: &Keys) -> ParticleOptions {
+        let key = match self {
+            Fx::Block => k.block,
+            Fx::DustPillar => k.dust_pillar,
+            Fx::Poof => k.poof,
+            Fx::HappyVillager => k.happy_villager,
+            Fx::Crit => k.crit,
+            Fx::Heart => k.heart,
+            Fx::Cloud => k.cloud,
+            Fx::CherryLeaves => k.cherry_leaves,
+            Fx::PaleOakLeaves => k.pale_oak_leaves,
+            Fx::CrimsonSpore => k.crimson_spore,
+            Fx::WarpedSpore => k.warped_spore,
+            Fx::Leaves(_) => k.tinted_leaves,
+            Fx::Dust(..) => k.dust,
+        };
+        let mut o = ParticleOptions::simple(key);
+        match self {
+            Fx::Leaves(rgb) => {
+                o.color = [
+                    ((rgb >> 16) & 0xFF) as f32 / 255.0,
+                    ((rgb >> 8) & 0xFF) as f32 / 255.0,
+                    (rgb & 0xFF) as f32 / 255.0,
+                    1.0,
+                ];
+            }
+            Fx::Dust(rgb, scale) => {
+                o.color = [rgb[0], rgb[1], rgb[2], 1.0];
+                o.scale = scale;
+            }
+            _ => {}
+        }
+        o
+    }
+
+    /// The particle as `/particle` writes it (`block` names the block for the block kinds).
+    fn command(self, block: Option<&str>) -> Option<String> {
+        Some(match self {
+            Fx::Block => format!("minecraft:block{{block_state:\"{}\"}}", block?),
+            Fx::DustPillar => format!("minecraft:dust_pillar{{block_state:\"{}\"}}", block?),
+            Fx::Poof => "minecraft:poof".to_owned(),
+            Fx::HappyVillager => "minecraft:happy_villager".to_owned(),
+            Fx::Crit => "minecraft:crit".to_owned(),
+            Fx::Heart => "minecraft:heart".to_owned(),
+            Fx::Cloud => "minecraft:cloud".to_owned(),
+            Fx::CherryLeaves => "minecraft:cherry_leaves".to_owned(),
+            Fx::PaleOakLeaves => "minecraft:pale_oak_leaves".to_owned(),
+            Fx::CrimsonSpore => "minecraft:crimson_spore".to_owned(),
+            Fx::WarpedSpore => "minecraft:warped_spore".to_owned(),
+            // ColorParticleOption: an ARGB int
+            Fx::Leaves(rgb) => format!(
+                "minecraft:tinted_leaves{{color:{}}}",
+                (0xFF00_0000 | rgb) as i32
+            ),
+            Fx::Dust(c, scale) => format!(
+                "minecraft:dust{{color:[{:?}f,{:?}f,{:?}f],scale:{:?}f}}",
+                c[0], c[1], c[2], scale
+            ),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------------
 
@@ -68,7 +211,7 @@ type Owner = Option<(u128, bool)>;
 struct Pending {
     dim: String,
     pos: Pos,
-    state: BlockStateId,
+    state: BlockState,
     player: u128,
     age: u32,
 }
@@ -79,15 +222,16 @@ struct Falling {
     dim: String,
     /// Who gets the loot at their feet, with that setting.
     owner: Owner,
-    fell: core::Fell,
+    fell: rules::Fell,
     /// The display showing each part.
-    ents: Vec<Option<u32>>,
-    states: Vec<BlockStateId>,
+    ents: Vec<Option<DisplayRef>>,
+    states: Vec<BlockState>,
     loot: Vec<Vec<ItemStack>>,
     /// Where its displays stand: the cut block's centre.
     anchor: [f64; 3],
     /// Where it touches the ground, and the block it touches.
-    contacts: Vec<([f64; 3], BlockStateId)>,
+    contacts: Vec<([f64; 3], BlockState)>,
+    /// The mobs it hit (their entity ids), and the players.
     struck: HashSet<u32>,
     struck_players: HashSet<u128>,
     whoosh: bool,
@@ -96,8 +240,8 @@ struct Falling {
     settled: bool,
     leaf: Option<String>,
     /// The cut block's ghost, shaking before it pops.
-    ghost: Option<u32>,
-    cut_state: BlockStateId,
+    ghost: Option<DisplayRef>,
+    cut_state: BlockState,
     /// The logs of other trees its trunk comes down on (a chain reaction).
     hits: Vec<Pos>,
     /// 0 for the tree a player cut, 1 for one it knocked down, and so on.
@@ -134,12 +278,12 @@ struct Tremble {
     pos: Pos,
     /// The face dug, pointing out of the block.
     face: Pos,
-    state: BlockStateId,
+    state: BlockState,
     player: u128,
-    /// Ticks the dig should take.
+    /// Ticks a shake lasts.
     ticks: u32,
     age: u32,
-    display: Option<u32>,
+    display: Option<DisplayRef>,
     /// A few of the tree's leaves, which shiver as it is dug.
     leaves: Vec<Pos>,
     checked: bool,
@@ -153,6 +297,10 @@ struct Tremble {
     tint: Option<u32>,
     /// Where the trunk will lie: the ground under each log once it has fallen.
     preview: Vec<[f64; 3]>,
+    /// The dig's crack (0 to 9) as the game last told it, the first one, and when.
+    stage: Option<i32>,
+    first_stage: Option<i32>,
+    staged_at: u32,
 }
 
 /// A player's own settings; -1 follows the world's.
@@ -200,8 +348,6 @@ struct State {
     config: Config,
     perso: HashMap<u128, Perso>,
     stats: HashMap<u128, Stats>,
-    /// Hunger owed by players for the trees they felled.
-    fatigue: HashMap<u128, f32>,
     shakes: Vec<ShakeReq>,
     /// When each tree (its foot) and each player last shook.
     shaken: HashMap<(String, Pos), u64>,
@@ -212,7 +358,7 @@ struct State {
     pending: Vec<Pending>,
     trees: Vec<Falling>,
     trembles: Vec<Tremble>,
-    rng: core::Rng,
+    rng: rules::Rng,
     session: u64,
     next_id: u64,
     tick: u64,
@@ -223,10 +369,8 @@ struct State {
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// Set while a hook works on the state, so a hook the work sets off waits its turn.
 static BUSY: AtomicBool = AtomicBool::new(false);
-/// Whether a log trembles somewhere (the players' ticks look only then).
-static TREMBLING: AtomicBool = AtomicBool::new(false);
-/// Whether a player owes hunger for a felling.
-static TIRED: AtomicBool = AtomicBool::new(false);
+/// Whether the world runs on a single player's (or LAN host's) own server.
+static INTEGRATED: AtomicBool = AtomicBool::new(false);
 /// The players' own settings, as the effects read them.
 static PERSO: Mutex<Option<HashMap<u128, Perso>>> = Mutex::new(None);
 
@@ -328,7 +472,6 @@ fn load(world: PathBuf) -> State {
         config,
         perso,
         stats,
-        fatigue: HashMap::new(),
         shakes: Vec::new(),
         shaken: HashMap::new(),
         shook: HashMap::new(),
@@ -337,7 +480,7 @@ fn load(world: PathBuf) -> State {
         pending: Vec::new(),
         trees: Vec::new(),
         trembles: Vec::new(),
-        rng: core::Rng::new(seed),
+        rng: rules::Rng::new(seed),
         session: seed & 0xFFFF_FFFF,
         next_id: 1,
         tick: 0,
@@ -404,8 +547,11 @@ fn save(st: &mut State) {
 
 /// Runs `f` on the open world's state (loaded on first use), unless another hook is
 /// already working on it.
-fn with_state<R>(game: &mut Game<'_>, f: impl FnOnce(&mut Game<'_>, &mut State) -> R) -> Option<R> {
-    let world = game.native_world_dir()?;
+fn with_state<R>(
+    host: &mut dyn ServerHost,
+    f: impl FnOnce(&mut dyn ServerHost, &mut State) -> R,
+) -> Option<R> {
+    let world = host.world_dir()?;
     if BUSY.swap(true, Ordering::Acquire) {
         return None;
     }
@@ -419,51 +565,56 @@ fn with_state<R>(game: &mut Game<'_>, f: impl FnOnce(&mut Game<'_>, &mut State) 
         None => load(world),
     };
     drop(slot);
-    let r = f(game, &mut st);
+    let r = f(host, &mut st);
     *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(st);
     BUSY.store(false, Ordering::Release);
     Some(r)
 }
 
 // ---------------------------------------------------------------------------------
-// Reading the level in place
+// Reading the level
 // ---------------------------------------------------------------------------------
 
-fn state_at(game: &Game<'_>, p: Pos) -> Option<BlockStateId> {
-    let w = &game.world;
-    if p[0].abs() >= 30_000_000
-        || p[2].abs() >= 30_000_000
-        || !(w.shape.min_y..w.shape.max_y()).contains(&p[1])
-        || !w.loaded(p[0], p[2])
-    {
+fn state_at(host: &dyn Host, level: LevelRef, p: Pos) -> Option<BlockState> {
+    if p[0].abs() >= 30_000_000 || p[2].abs() >= 30_000_000 {
         return None;
     }
-    Some(w.block(p[0], p[1], p[2]))
+    level.block_state(host, p)
 }
 
-fn in_tag(game: &Game<'_>, id: BlockStateId, tag: &str) -> bool {
-    game.pack
-        .assets
-        .registry
-        .state(id)
-        .is_some_and(|s| game.native_server_block_in_tag(s, tag).unwrap_or(false))
-}
-
-fn name_of(game: &Game<'_>, id: BlockStateId) -> String {
-    game.pack
-        .assets
-        .registry
-        .state(id)
-        .map(|s| s.name.to_string())
+/// The block's name, without its properties: `minecraft:oak_log`.
+fn name_of(host: &dyn Host, id: BlockState) -> String {
+    host.block_states()
+        .name(id.block())
+        .map(str::to_owned)
         .unwrap_or_default()
 }
 
-fn prop(game: &Game<'_>, id: BlockStateId, key: &str) -> Option<String> {
-    let s = game.pack.assets.registry.state(id)?;
-    s.properties
-        .iter()
-        .find(|(k, _)| k.to_string() == key)
-        .map(|(_, v)| v.to_string())
+fn in_tag(host: &dyn Host, id: BlockState, tag: &str) -> bool {
+    host.block_in_tag(id.block(), tag).unwrap_or(false)
+}
+
+fn prop(host: &dyn Host, id: BlockState, key: &str) -> Option<String> {
+    let states = host.block_states();
+    id.property(&states, key).ok().flatten().map(str::to_owned)
+}
+
+/// The state `id` with property `key` set to `value`.
+fn with_prop(host: &dyn Host, id: BlockState, key: &str, value: &str) -> Option<BlockState> {
+    let states = host.block_states();
+    id.with(&states, key, value).ok()
+}
+
+fn is_air(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+    )
+}
+
+/// The collision boxes of `id` at `p`, each `[min x, y, z, max x, y, z]` in the block.
+fn collision(host: &dyn Host, level: LevelRef, id: BlockState, p: Pos) -> Option<Vec<[f64; 6]>> {
+    level.block_shape(host, id, p, BlockShapeKind::Collision)
 }
 
 /// `oak` of `minecraft:stripped_oak_log`.
@@ -477,21 +628,24 @@ fn species(name: &str) -> &str {
 }
 
 /// What hangs on trees, and how.
-fn hanger(game: &Game<'_>, id: BlockStateId, name: &str) -> Option<core::Attach> {
-    use core::Attach::*;
+fn hanger(host: &dyn Host, id: BlockState, name: &str) -> Option<rules::Attach> {
+    use rules::Attach::*;
     Some(match name.trim_start_matches("minecraft:") {
         "vine" | "cocoa" | "bee_nest" | "glow_lichen" | "resin_clump" | "creaking_heart" => Side,
         "pale_hanging_moss" | "weeping_vines" | "weeping_vines_plant" => Below,
-        "mangrove_propagule" if prop(game, id, "hanging").as_deref() == Some("true") => Below,
+        "mangrove_propagule" if prop(host, id, "hanging").as_deref() == Some("true") => Below,
         "snow" => Above,
         _ => return None,
     })
 }
 
-/// The rules' view of the level in place.
-struct Reader<'g, 'a> {
-    game: &'g Game<'a>,
-    cells: HashMap<BlockStateId, Cell>,
+/// The rules' view of the level.
+struct Reader<'g> {
+    host: &'g dyn Host,
+    level: LevelRef,
+    /// The level's lowest block and the one above its highest.
+    bounds: Option<(i32, i32)>,
+    cells: HashMap<BlockState, Cell>,
     woods: HashMap<String, u16>,
     /// Huge fungi and mushrooms are trees too.
     fungi: bool,
@@ -510,14 +664,16 @@ fn is_cap(name: &str) -> bool {
 }
 
 /// A trunk block: a log, wood, a stem or hyphae, or a mushroom's stem.
-fn is_trunk(game: &Game<'_>, id: BlockStateId) -> bool {
-    in_tag(game, id, "minecraft:logs") || name_of(game, id) == "minecraft:mushroom_stem"
+fn is_trunk(host: &dyn Host, id: BlockState) -> bool {
+    in_tag(host, id, "minecraft:logs") || name_of(host, id) == "minecraft:mushroom_stem"
 }
 
-impl<'g, 'a> Reader<'g, 'a> {
-    fn new(game: &'g Game<'a>, config: &Config) -> Self {
+impl<'g> Reader<'g> {
+    fn new(host: &'g dyn Host, level: LevelRef, config: &Config) -> Self {
         Reader {
-            game,
+            host,
+            level,
+            bounds: level.height(host).map(|(min, height)| (min, min + height)),
             cells: HashMap::new(),
             woods: HashMap::new(),
             fungi: config.on(Key::Fungi),
@@ -527,16 +683,15 @@ impl<'g, 'a> Reader<'g, 'a> {
         let n = self.woods.len() as u16;
         *self.woods.entry(species(name).to_owned()).or_insert(n + 1)
     }
-    fn classify(&mut self, id: BlockStateId) -> Cell {
+    fn classify(&mut self, id: BlockState, p: Pos) -> Cell {
         if let Some(c) = self.cells.get(&id) {
             return *c;
         }
-        let game = self.game;
-        let name = name_of(game, id);
-        let b = game.res.behaviours();
-        let cell = if b.is_air(id) {
+        let host = self.host;
+        let name = name_of(host, id);
+        let cell = if is_air(&name) {
             Cell::Open
-        } else if in_tag(game, id, "minecraft:logs")
+        } else if in_tag(host, id, "minecraft:logs")
             || (self.fungi && name == "minecraft:mushroom_stem")
         {
             Cell::Log {
@@ -544,22 +699,22 @@ impl<'g, 'a> Reader<'g, 'a> {
             }
         } else if self.fungi && is_cap(&name) {
             Cell::Cap
-        } else if in_tag(game, id, "minecraft:leaves") {
+        } else if in_tag(host, id, "minecraft:leaves") {
             Cell::Leaves {
-                distance: prop(game, id, "distance")
+                distance: prop(host, id, "distance")
                     .and_then(|d| d.parse().ok())
                     .unwrap_or(7),
-                persistent: prop(game, id, "persistent").as_deref() == Some("true"),
+                persistent: prop(host, id, "persistent").as_deref() == Some("true"),
             }
-        } else if let Some(a) = hanger(game, id, &name) {
+        } else if let Some(a) = hanger(host, id, &name) {
             Cell::Hanger(a)
-        } else if b.is_replaceable(id) {
+        } else if host.block_states().replaceable(id) == Some(true) {
             Cell::Open
         } else {
-            match b.collision_shape(id) {
+            match collision(host, self.level, id, p) {
                 Some(s) if s.is_empty() => Cell::Open,
                 // carpets, rails, pressure plates: the tree lies on top of them
-                Some(s) if s.max(horizon_core::geometry::Axis::Y) <= 0.2 => Cell::Open,
+                Some(s) if s.iter().all(|b| b[4] <= 0.2) => Cell::Open,
                 _ => Cell::Solid,
             }
         };
@@ -568,16 +723,17 @@ impl<'g, 'a> Reader<'g, 'a> {
     }
 }
 
-impl core::World for Reader<'_, '_> {
+impl rules::World for Reader<'_> {
     fn cell(&mut self, p: Pos) -> Option<Cell> {
-        let w = &self.game.world;
-        if p[0].abs() >= 30_000_000 || p[2].abs() >= 30_000_000 || !w.loaded(p[0], p[2]) {
+        if p[0].abs() >= 30_000_000 || p[2].abs() >= 30_000_000 {
             return None;
         }
-        if !(w.shape.min_y..w.shape.max_y()).contains(&p[1]) {
+        let (min, max) = self.bounds?;
+        if !(min..max).contains(&p[1]) {
             return Some(Cell::Open);
         }
-        Some(self.classify(w.block(p[0], p[1], p[2])))
+        let id = self.level.block_state(self.host, p)?;
+        Some(self.classify(id, p))
     }
 }
 
@@ -594,124 +750,212 @@ struct Cutter {
     held: Option<ItemStack>,
 }
 
-fn cutter(game: &Game<'_>, uuid: u128) -> Option<Cutter> {
-    let host = game.lan.as_ref()?;
-    let g = host
-        .hub
-        .guests
-        .iter()
-        .find(|g| g.uuid == uuid && g.placed && !g.dead)?;
+/// The rules' number for a game mode.
+fn mode_number(mode: GameMode) -> i32 {
+    match mode {
+        GameMode::Survival => 0,
+        GameMode::Creative => 1,
+        GameMode::Adventure => 2,
+        GameMode::Spectator => 3,
+    }
+}
+
+fn dimension_of(host: &dyn Host, player: PlayerRef) -> Option<String> {
+    player.dimension(host).map(|d| d.to_string())
+}
+
+/// A living player of the server, as the felling needs them.
+fn cutter(host: &dyn Host, uuid: u128) -> Option<Cutter> {
+    let player = host.player(uuid)?;
+    let living = host.living(player.entity())?;
+    if living.alive(host) != Some(true) {
+        return None;
+    }
     Some(Cutter {
-        name: g.name.clone(),
-        dim: g.dimension.clone(),
-        yaw: g.yaw,
-        game_mode: g.game_mode,
-        sneaking: g.sneaking,
-        held: g
-            .inventory
-            .get(g.selected)
-            .cloned()
-            .flatten()
-            .filter(|s| s.count > 0),
+        name: player.name(host)?,
+        dim: dimension_of(host, player)?,
+        yaw: player.entity().rotation(host)?[0],
+        game_mode: mode_number(player.game_mode(host)?),
+        sneaking: player.entity().is_shift_key_down(host).unwrap_or(false),
+        held: living.hand_item(host, Hand::Main),
     })
 }
 
+/// An entry of an item's component patch.
+fn component<'a>(patch: &'a Compound, key: &str) -> Option<&'a Tag> {
+    patch
+        .iter()
+        .find(|(k, _)| k.to_string_lossy() == key)
+        .map(|(_, v)| v)
+}
+
 /// The tool's durability, unless it has none or can't break.
-fn max_damage(game: &Game<'_>, stack: &ItemStack) -> Option<u32> {
-    let components = horizon_client::item_data::encode_components(stack);
-    let get = |k: &str| components.as_ref().and_then(|c| c.get(k));
-    if get("minecraft:unbreakable").is_some() {
+fn max_damage(host: &dyn Host, stack: &ItemStack) -> Option<u32> {
+    let patch = stack.components().map(|c| c.as_nbt());
+    if patch
+        .and_then(|p| component(p, "minecraft:unbreakable"))
+        .is_some()
+    {
         return None;
     }
-    let max = match get("minecraft:max_damage") {
+    let max = match patch.and_then(|p| component(p, "minecraft:max_damage")) {
         Some(Tag::Int(v)) if *v > 0 => *v as u32,
-        _ => game
-            .res
-            .items()
-            .get(&stack.item)
-            .map_or(0, |i| i.max_damage),
+        _ => host.max_damage(stack.item()).unwrap_or(0),
     };
     (max > 0).then_some(max)
 }
 
-/// Whether `uuid` owns this single player world (cheats or not).
-fn owner(game: &Game<'_>, uuid: u128) -> bool {
-    game.lan
-        .as_ref()
-        .and_then(|h| h.hub.singleplayer_owner)
-        .is_some_and(|o| o == uuid)
+/// The level of enchantment `id` (`minecraft:unbreaking`) on the stack.
+fn enchantment(stack: &ItemStack, id: &str) -> u32 {
+    let Some(patch) = stack.components().map(|c| c.as_nbt()) else {
+        return 0;
+    };
+    let Some(Tag::Compound(map)) = component(patch, "minecraft:enchantments") else {
+        return 0;
+    };
+    // worlds older than 1.21.5 wrap the levels in {levels: {...}}
+    let map = match component(map, "levels") {
+        Some(Tag::Compound(inner)) => inner,
+        _ => map,
+    };
+    let short = id.trim_start_matches("minecraft:");
+    map.iter()
+        .find(|(k, _)| {
+            let k = k.to_string_lossy();
+            k == id || k == short
+        })
+        .and_then(|(_, v)| match v {
+            Tag::Byte(l) => Some(i32::from(*l)),
+            Tag::Short(l) => Some(i32::from(*l)),
+            Tag::Int(l) => Some(*l),
+            _ => None,
+        })
+        .map_or(0, |l| l.max(0) as u32)
+}
+
+/// Whether the stack's item is in the item tag `tag`.
+fn item_in_tag(host: &dyn Host, stack: &ItemStack, tag: &str) -> bool {
+    let Ok(id) = Identifier::parse(tag) else {
+        return false;
+    };
+    let tags = host.tags();
+    tags.key(&id)
+        .and_then(|key| tags.is_in_tag(stack.item(), key))
+        .unwrap_or(false)
+}
+
+/// One item `name` (`minecraft:oak_sapling`).
+fn stack_of(host: &dyn Host, name: &str) -> Option<ItemStack> {
+    let id = Identifier::parse(name).ok()?;
+    Some(ItemStack::of(host.item_key(&id)?))
+}
+
+/// Whether `uuid` owns this single player world (cheats or not): its server is the
+/// window's own and they joined it first.
+fn owner(host: &dyn ServerHost, uuid: u128) -> bool {
+    INTEGRATED.load(Ordering::Relaxed)
+        && host
+            .players()
+            .server_players()
+            .first()
+            .is_some_and(|p| p.uuid() == uuid)
 }
 
 // ---------------------------------------------------------------------------------
 // Effects
 // ---------------------------------------------------------------------------------
 
+/// The players of `level`, with where they stand.
+fn nearby(host: &dyn Host, level: LevelRef) -> Vec<(PlayerRef, [f64; 3])> {
+    level
+        .online_players(host)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| Some((p, p.entity().position(host)?)))
+        .collect()
+}
+
 /// A sound of the game at `at`, to each player near enough, at their own volume
-/// (or the world's).
-fn sound(game: &mut Game<'_>, config: &Config, name: &str, at: [f64; 3], volume: f64, pitch: f64) {
-    let world = f64::from(config.get(Key::Volume)) / 100.0;
+/// (or the world's). When they all hear it alike it is one sound of the level;
+/// otherwise each player gets their own (`playsound`).
+fn sound(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    config: &Config,
+    name: &str,
+    at: [f64; 3],
+    volume: f64,
+    pitch: f64,
+) {
     if volume <= 0.0 {
         return;
     }
-    let dimension = game.dim.id();
+    let world = f64::from(config.get(Key::Volume)) / 100.0;
     let pitch = pitch.clamp(0.5, 2.0) as f32;
-    let Some(host) = &game.lan else {
-        if world > 0.0 {
-            game.creatures.lan_sounds.push(NativeSound {
-                dimension,
-                sound: name.to_owned(),
-                at,
-                source: BLOCKS,
-                volume: (volume * world) as f32,
-                pitch,
-            });
-        }
+    // vanilla's reach of a sound: 16 blocks, times its volume above 1
+    let reach = |v: f32| f64::from(v.max(1.0)) * 16.0;
+    // each player of the level: their volume, and how far they are (squared)
+    let players: Vec<(PlayerRef, f32, f64)> = nearby(host, level)
+        .into_iter()
+        .map(|(p, pos)| {
+            let own = perso_of(p.uuid()).volume;
+            let scale = if own >= 0 {
+                f64::from(own) / 100.0
+            } else {
+                world
+            };
+            let d: f64 = (0..3).map(|k| (pos[k] - at[k]).powi(2)).sum();
+            (p, (volume * scale) as f32, d)
+        })
+        .collect();
+    let hearers: Vec<(PlayerRef, f32)> = players
+        .iter()
+        .filter(|(_, v, d)| *d <= reach(*v).powi(2))
+        .map(|(p, v, _)| (*p, *v))
+        .collect();
+    let Some(&(_, first)) = hearers.first() else {
         return;
     };
-    if name.starts_with("minecraft:")
-        && host
-            .hub
-            .registry_id("minecraft:sound_event", name)
-            .is_none()
+    // one sound of the level reaches everyone within its reach: it does when they
+    // all hear it alike, and no one else hears it
+    if hearers.iter().all(|(_, v)| *v == first)
+        && players
+            .iter()
+            .all(|(_, v, d)| *v == first || *d > reach(first).powi(2))
     {
+        if first > 0.0 {
+            level.play_sound(host, name, at, SoundSource::Blocks, first, pitch);
+        }
         return;
     }
-    for g in host
-        .hub
-        .guests
-        .iter()
-        .filter(|g| g.placed && g.dimension == dimension)
-    {
-        let own = perso_of(g.uuid).volume;
-        let scale = if own >= 0 {
-            f64::from(own) / 100.0
-        } else {
-            world
-        };
-        let v = (volume * scale) as f32;
+    let Some(dim) = level.dimension().id(host) else {
+        return;
+    };
+    for (p, v) in hearers {
         if v <= 0.0 {
             continue;
         }
-        let range = f64::from(v.max(1.0)) * 16.0;
-        let d: f64 = (0..3).map(|k| (g.position[k] - at[k]).powi(2)).sum();
-        if d > range * range {
+        let Some(who) = p.name(host) else {
             continue;
-        }
-        let packet = host
-            .hub
-            .sound_packet(name, at, v, pitch, BLOCKS, host.hub.next_sound_seed());
-        g.send(&packet);
+        };
+        host.commands().run_command(&format!(
+            "execute in {dim} run playsound {name} block {who} {:.3} {:.3} {:.3} {v:.3} {pitch:.3}",
+            at[0], at[1], at[2]
+        ));
     }
 }
 
 /// `base` particles at the "normales" setting, to each player within 32 blocks,
 /// as many as their own setting (or the world's) says. `only` picks the players.
+/// When they all see alike it is one send of the level; otherwise each player gets
+/// their own (`particle ... normal <player>`).
 #[allow(clippy::too_many_arguments)]
 fn particles_to(
-    game: &mut Game<'_>,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
     config: &Config,
-    options: ParticleOptions,
-    state: Option<BlockStateId>,
+    fx: Fx,
+    state: Option<BlockState>,
     at: [f64; 3],
     spread: [f64; 3],
     speed: f64,
@@ -719,78 +963,79 @@ fn particles_to(
     only: &dyn Fn(u128) -> bool,
 ) {
     const LEVELS: [f64; 4] = [0.0, 0.4, 1.0, 2.0];
+    let Some(keys) = keys() else {
+        return;
+    };
     let world = config.get(Key::Particles).clamp(0, 3);
-    let dimension = game.dim.id();
-    let Some(host) = &game.lan else {
-        let k = LEVELS[world as usize];
-        if k > 0.0 {
-            game.lan_send_particles(QueuedParticle {
-                dimension,
-                options,
-                state,
-                at,
-                spread,
-                speed,
-                count: ((base * k).round() as i32).max(1),
-                randomization: 0,
-            });
-        }
-        return;
-    };
-    let Some(particle) = Game::hub_particle(&host.hub, &options, state) else {
-        return;
-    };
-    for g in host
-        .hub
-        .guests
-        .iter()
-        .filter(|g| g.placed && g.dimension == dimension)
-    {
-        if !only(g.uuid) {
-            continue;
-        }
+    let mut viewers: Vec<(PlayerRef, i32)> = Vec::new();
+    for (p, pos) in nearby(host, level) {
         // BlockPos.closerToCenterThan(at, 32): from the centre of the player's block
-        let d: f64 = (0..3)
-            .map(|k| (g.position[k].floor() + 0.5 - at[k]).powi(2))
-            .sum();
+        let d: f64 = (0..3).map(|k| (pos[k].floor() + 0.5 - at[k]).powi(2)).sum();
         if d >= 32.0 * 32.0 {
             continue;
         }
-        let own = perso_of(g.uuid).particles;
-        let level = if own >= 0 { own.min(3) } else { world };
-        let k = LEVELS[level as usize];
-        if k == 0.0 {
+        let count = if only(p.uuid()) {
+            let own = perso_of(p.uuid()).particles;
+            let setting = if own >= 0 { own.min(3) } else { world };
+            let k = LEVELS[setting as usize];
+            if k == 0.0 {
+                0
+            } else {
+                ((base * k).round() as i32).max(1)
+            }
+        } else {
+            0
+        };
+        viewers.push((p, count));
+    }
+    let Some(&(_, first)) = viewers.first() else {
+        return;
+    };
+    if viewers.iter().all(|(_, c)| *c == first) {
+        if first > 0 {
+            level.send_particles(host, &fx.options(&keys), state, at, spread, speed, first);
+        }
+        return;
+    }
+    // `/particle` shows only to viewers in the level it runs in
+    let Some(dim) = level.dimension().id(host) else {
+        return;
+    };
+    let block = state.map(|s| name_of(host, s));
+    let Some(particle) = fx.command(block.as_deref()) else {
+        return;
+    };
+    for (p, count) in viewers {
+        if count == 0 {
             continue;
         }
-        let packet = Clientbound::LevelParticles(play::LevelParticles {
-            particle: particle.clone(),
-            override_limiter: false,
-            always_show: false,
-            pos: at,
-            dist: spread.map(|v| v as f32),
-            max_speed: [speed as f32; 3],
-            count: ((base * k).round() as i32).max(1),
-            randomization: 0,
-        });
-        g.send(&packet);
+        let Some(who) = p.name(host) else {
+            continue;
+        };
+        host.commands().run_command(&format!(
+            "execute in {dim} run particle {particle} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {count} normal {who}",
+            at[0], at[1], at[2], spread[0], spread[1], spread[2], speed
+        ));
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn particles(
-    game: &mut Game<'_>,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
     config: &Config,
-    options: ParticleOptions,
-    state: Option<BlockStateId>,
+    fx: Fx,
+    state: Option<BlockState>,
     at: [f64; 3],
     spread: [f64; 3],
     speed: f64,
     base: f64,
 ) {
     particles_to(
-        game,
+        host,
+        level,
         config,
-        options,
+        fx,
         state,
         at,
         spread,
@@ -800,11 +1045,19 @@ fn particles(
     );
 }
 
-fn block_bits(game: &mut Game<'_>, config: &Config, state: BlockStateId, at: [f64; 3], base: f64) {
+fn block_bits(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    config: &Config,
+    state: BlockState,
+    at: [f64; 3],
+    base: f64,
+) {
     particles(
-        game,
+        host,
+        level,
         config,
-        ParticleOptions::simple(ParticleType::Block),
+        Fx::Block,
         Some(state),
         at,
         [0.25, 0.25, 0.25],
@@ -872,37 +1125,48 @@ fn biome_tinted(leaf: &str) -> bool {
     matches!(species(leaf), "oak" | "jungle" | "acacia" | "dark_oak")
 }
 
-/// The foliage colour of the biome at `p`.
-fn foliage_at(game: &Game<'_>, p: Pos) -> Option<u32> {
-    let chunk = game.world.chunks.get(&(p[0] >> 4, p[2] >> 4))?;
-    let biome = chunk.biome(p[0], p[1], p[2]);
-    Some(game.res.biomes().get(biome).foliage)
+/// The foliage colour of the biome at `p`, for the biomes where trees of those kinds
+/// grow (vanilla's colormap at their climate, or their own foliage colour). Others get
+/// the leaves' own colour.
+fn foliage_at(host: &dyn Host, level: LevelRef, p: Pos) -> Option<u32> {
+    let biome = level.biome_at(host, p)?;
+    Some(match biome.trim_start_matches("minecraft:") {
+        "plains" | "sunflower_plains" | "beach" => 0x77AB2F,
+        "forest" | "flower_forest" | "dark_forest" => 0x59AE30,
+        "jungle" | "bamboo_jungle" => 0x30BB0B,
+        "sparse_jungle" => 0x3EB80F,
+        "savanna" | "savanna_plateau" | "windswept_savanna" => 0xAEA42A,
+        "swamp" => 0x6A7039,
+        "mangrove_swamp" => 0x8DB127,
+        "badlands" | "wooded_badlands" | "eroded_badlands" => 0x9E814D,
+        _ => return None,
+    })
 }
 
 /// The tint of the leaves of a tree at `p`: its biome's for the leaves that take
 /// it, else none (their own colour).
-fn tint_for(game: &Game<'_>, leaf: Option<&str>, p: Pos) -> Option<u32> {
+fn tint_for(host: &dyn Host, level: LevelRef, leaf: Option<&str>, p: Pos) -> Option<u32> {
     leaf.filter(|l| biome_tinted(l))
-        .and_then(|_| foliage_at(game, p))
+        .and_then(|_| foliage_at(host, level, p))
 }
 
 /// The falling-leaf particle of a leaf block, tinted as its foliage is (`tint`,
 /// the biome's, for the leaves that take it); spores for a fungus's wart, none
 /// for a mushroom's cap.
-fn leaf_particle(leaf: &str, tint: Option<u32>) -> Option<ParticleOptions> {
+fn leaf_particle(leaf: &str, tint: Option<u32>) -> Option<Fx> {
     let bare = leaf.trim_start_matches("minecraft:");
     if bare == "nether_wart_block" {
-        return Some(ParticleOptions::simple(ParticleType::CrimsonSpore));
+        return Some(Fx::CrimsonSpore);
     }
     if bare == "warped_wart_block" {
-        return Some(ParticleOptions::simple(ParticleType::WarpedSpore));
+        return Some(Fx::WarpedSpore);
     }
     if is_cap(bare) {
         return None;
     }
     let fixed = match species(leaf) {
-        "cherry" => return Some(ParticleOptions::simple(ParticleType::CherryLeaves)),
-        "pale_oak" => return Some(ParticleOptions::simple(ParticleType::PaleOakLeaves)),
+        "cherry" => return Some(Fx::CherryLeaves),
+        "pale_oak" => return Some(Fx::PaleOakLeaves),
         "spruce" => 0x619961,
         "birch" => 0x80A755,
         "jungle" => 0x30BB0B,
@@ -911,15 +1175,9 @@ fn leaf_particle(leaf: &str, tint: Option<u32>) -> Option<ParticleOptions> {
         "azalea" | "flowering_azalea" => 0x6E9A35,
         _ => 0x59AE30,
     };
-    let rgb = tint.filter(|_| biome_tinted(leaf)).unwrap_or(fixed);
-    let mut o = ParticleOptions::simple(ParticleType::TintedLeaves);
-    o.color = [
-        ((rgb >> 16) & 0xFF) as f32 / 255.0,
-        ((rgb >> 8) & 0xFF) as f32 / 255.0,
-        (rgb & 0xFF) as f32 / 255.0,
-        1.0,
-    ];
-    Some(o)
+    Some(Fx::Leaves(
+        tint.filter(|_| biome_tinted(leaf)).unwrap_or(fixed),
+    ))
 }
 
 // ---------------------------------------------------------------------------------
@@ -930,28 +1188,39 @@ fn floats(v: &[f32]) -> Tag {
     Tag::List(v.iter().map(|x| Tag::Float(x.to_bits())).collect())
 }
 
+/// `minecraft:oak_log[axis=y]` as its name and its properties.
+fn split_state(text: &str) -> (&str, Vec<(&str, &str)>) {
+    let Some((name, rest)) = text.split_once('[') else {
+        return (text, Vec::new());
+    };
+    let props = rest
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .collect();
+    (name, props)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn summon_display(
-    game: &mut Game<'_>,
+    host: &mut dyn ServerHost,
     dim: &str,
     anchor: [f64; 3],
-    state: BlockStateId,
+    state: BlockState,
     translation: [f32; 3],
     scale: f32,
     session: u64,
     tree: u64,
-) -> Option<u32> {
-    let s = game.pack.assets.registry.state(state)?.clone();
+) -> Option<DisplayRef> {
+    let text = host.block_state_string(state)?;
+    let (name, props) = split_state(&text);
     let mut block = Compound::new();
-    block.insert("Name".into(), Tag::String(s.name.as_str().into()));
-    let mut props = Compound::new();
-    for (k, v) in s.properties.iter() {
-        props.insert(
-            k.to_string().as_str().into(),
-            Tag::String(v.to_string().as_str().into()),
-        );
+    block.insert("Name".into(), Tag::String(name.into()));
+    let mut properties = Compound::new();
+    for (k, v) in props {
+        properties.insert(k.into(), Tag::String(v.into()));
     }
-    block.insert("Properties".into(), Tag::Compound(props));
+    block.insert("Properties".into(), Tag::Compound(properties));
     let mut t = Compound::new();
     t.insert("translation".into(), floats(&translation));
     t.insert("left_rotation".into(), floats(&[0.0, 0.0, 0.0, 1.0]));
@@ -960,7 +1229,8 @@ fn summon_display(
     let mut c = Compound::new();
     c.insert("block_state".into(), Tag::Compound(block));
     c.insert("transformation".into(), Tag::Compound(t));
-    c.insert("interpolation_duration".into(), Tag::Int(0));
+    // each new pose eases over one tick
+    c.insert("interpolation_duration".into(), Tag::Int(1));
     c.insert("start_interpolation".into(), Tag::Int(0));
     c.insert("teleport_duration".into(), Tag::Int(0));
     c.insert("view_range".into(), Tag::Float(1.5f32.to_bits()));
@@ -977,60 +1247,54 @@ fn summon_display(
                 .collect(),
         ),
     );
-    game.native_summon(dim, "minecraft:block_display", anchor, c)
+    let id = host.summon(dim, "minecraft:block_display", anchor, c)?;
+    let entity = host.entity(id)?;
+    host.display(entity)
 }
 
-/// A display's next pose, eased over one tick, sent to the players who see it: the
-/// interpolation restarts (start 0) toward the new translation and rotation.
-fn pose(game: &Game<'_>, id: u32, translation: [f32; 3], rotation: [f32; 4]) {
-    let Some(host) = &game.lan else {
-        return;
+/// A display's next pose: its transformation is set and the players who see it ease
+/// toward it over one tick (the interpolation restarts).
+fn pose(
+    host: &mut dyn ServerHost,
+    display: DisplayRef,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    scale: f32,
+) {
+    let t = Transformation {
+        translation,
+        left_rotation: rotation,
+        scale: [scale; 3],
+        ..Transformation::IDENTITY
     };
-    let packet = Clientbound::SetEntityData(SetEntityData {
-        id: id as i32,
-        values: vec![
-            (8, serializer::INT, Value::Int(0)),
-            (9, serializer::INT, Value::Int(1)),
-            (11, serializer::VECTOR3, Value::Floats(translation.to_vec())),
-            (13, serializer::QUATERNION, Value::Floats(rotation.to_vec())),
-        ],
-    });
-    host.hub.send_to_tracking(id as i32, &packet);
+    if display.set_transformation(host, t) {
+        display.set_start_interpolation(host, 0);
+    }
 }
 
-/// `pose`, also scaled (a block puffing up or the cut block's ghost).
-fn pose_scaled(game: &Game<'_>, id: u32, translation: [f32; 3], rotation: [f32; 4], scale: f32) {
-    let Some(host) = &game.lan else {
-        return;
-    };
-    let packet = Clientbound::SetEntityData(SetEntityData {
-        id: id as i32,
-        values: vec![
-            (8, serializer::INT, Value::Int(0)),
-            (9, serializer::INT, Value::Int(1)),
-            (11, serializer::VECTOR3, Value::Floats(translation.to_vec())),
-            (12, serializer::VECTOR3, Value::Floats(vec![scale; 3])),
-            (13, serializer::QUATERNION, Value::Floats(rotation.to_vec())),
-        ],
-    });
-    host.hub.send_to_tracking(id as i32, &packet);
+fn remove(host: &mut dyn ServerHost, display: DisplayRef) {
+    display.entity().discard(host);
 }
 
 // ---------------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------------
 
-/// `native_destroy_block`: a player breaks a block. A log is looked at on the next
-/// tick of its level, once the game broke it.
-pub(super) fn destroy(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
-    if !game.native_on(MOD) || !is_trunk(game, state) {
+/// `break_block`: a player breaks a block. A log is looked at on the next tick of
+/// its level, once the game broke it.
+pub(crate) fn destroy(host: &mut dyn ServerHost, pos: Pos, state: BlockState) {
+    if !host.on(MOD) || !is_trunk(host, state) {
         return;
     }
-    let Some(player) = game.native_acting_player() else {
+    let Some(player) = host.players().acting_player() else {
         return;
     };
-    with_state(game, |_, st| {
-        if let Some(set) = st.placed.get_mut(&player.dimension)
+    let Some(dim) = dimension_of(host, player) else {
+        return;
+    };
+    let uuid = player.uuid();
+    with_state(host, |_, st| {
+        if let Some(set) = st.placed.get_mut(&dim)
             && set.remove(&pos)
         {
             // a placed log goes: it is never a tree's
@@ -1038,44 +1302,42 @@ pub(super) fn destroy(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
             return;
         }
         st.pending.push(Pending {
-            dim: player.dimension,
+            dim,
             pos,
             state,
-            player: player.uuid,
+            player: uuid,
             age: 0,
         });
     });
 }
 
-/// `native_left_click_block`: a player starts digging a block. A log trembles
-/// while it is dug, unless it breaks at the first blow.
-pub(super) fn left_click(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], state: BlockStateId) {
-    if !game.native_on(MOD) || !is_trunk(game, state) {
+/// `left_click_block`: a player starts digging a block. A log trembles while it is
+/// dug, unless it breaks at the first blow.
+pub(crate) fn left_click(host: &mut dyn ServerHost, pos: Pos, face: Pos, state: BlockState) {
+    if !host.on(MOD) || !is_trunk(host, state) {
         return;
     }
-    let Some(player) = game.native_acting_player() else {
+    let Some(player) = host.players().acting_player() else {
         return;
     };
-    // the dig's progress each tick, with this player's tool and effects
-    let progress = game.destroy_progress(pos);
-    if !(progress > 0.0 && progress < 0.5) {
+    let Some(dim) = dimension_of(host, player) else {
         return;
-    }
-    let ticks = (1.0 / progress).ceil() as u32;
-    with_state(game, |_, st| {
-        if !st.config.on(Key::Shake) || st.off.contains(&player.uuid) {
+    };
+    let uuid = player.uuid();
+    with_state(host, |_, st| {
+        if !st.config.on(Key::Shake) || st.off.contains(&uuid) {
             return;
         }
-        for t in st.trembles.iter_mut().filter(|t| t.player == player.uuid) {
+        for t in st.trembles.iter_mut().filter(|t| t.player == uuid) {
             t.stopped = true;
         }
         st.trembles.push(Tremble {
-            dim: player.dimension,
+            dim,
             pos,
             face,
             state,
-            player: player.uuid,
-            ticks,
+            player: uuid,
+            ticks: 0,
             age: 0,
             display: None,
             leaves: Vec::new(),
@@ -1085,95 +1347,132 @@ pub(super) fn left_click(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3], sta
             shaking: false,
             tint: None,
             preview: Vec::new(),
+            stage: None,
+            first_stage: None,
+            staged_at: 0,
         });
-        TREMBLING.store(true, Ordering::Relaxed);
     });
 }
 
-/// `native_player_tick`: a player who stopped digging lets their log be.
-pub(super) fn player_tick(game: &mut Game<'_>) {
-    let digging_stopped = TREMBLING.load(Ordering::Relaxed) && !game.left;
-    let tired = TIRED.load(Ordering::Relaxed);
-    if !digging_stopped && !tired {
-        return;
-    }
-    let Some(player) = game.native_acting_player() else {
-        return;
-    };
-    let owed = with_state(game, |_, st| {
-        if digging_stopped {
-            // a dig that only just started may not show as one yet
-            for t in st
-                .trembles
-                .iter_mut()
-                .filter(|t| t.player == player.uuid && t.age >= 2 && !t.shaking)
-            {
-                t.stopped = true;
-            }
+/// `block_break_progress_update`: the crack of a player's dig grew.
+pub(crate) fn dig_progress(host: &mut dyn ServerHost, player: u128, pos: Pos, stage: i32) {
+    with_state(host, |_, st| {
+        if let Some(t) = st
+            .trembles
+            .iter_mut()
+            .find(|t| t.player == player && t.pos == pos && !t.shaking && !t.stopped)
+        {
+            t.first_stage.get_or_insert(stage);
+            t.stage = Some(stage);
+            t.staged_at = t.age;
         }
-        let owed = st.fatigue.remove(&player.uuid);
-        TIRED.store(!st.fatigue.is_empty(), Ordering::Relaxed);
-        owed
-    })
-    .flatten();
-    // the player's own state is in place: they get hungrier
-    if let Some(exhaustion) = owed
-        && let Some(p) = game.player.as_mut()
-    {
-        p.cause_food_exhaustion(exhaustion);
-    }
+    });
 }
 
-/// `native_right_click_block`: a right click with an empty hand on a trunk
+/// `block_damage_abort`: a player stopped digging; their log is let be.
+pub(crate) fn dig_stopped(host: &mut dyn ServerHost, player: u128, pos: Pos) {
+    with_state(host, |_, st| {
+        for t in st
+            .trembles
+            .iter_mut()
+            .filter(|t| t.player == player && t.pos == pos && !t.shaking)
+        {
+            t.stopped = true;
+        }
+    });
+}
+
+/// `right_click_block`, on the server: a right click with an empty hand on a trunk
 /// shakes the tree.
-pub(super) fn right_click(game: &mut Game<'_>, pos: [i32; 3], face: [i32; 3]) {
-    if !game.native_on(MOD) {
+pub(crate) fn right_click(host: &mut dyn ServerHost, click: &BlockClick) {
+    if !matches!(click.side, LogicalSide::Server)
+        || !matches!(click.hand, Hand::Main)
+        || click.stack.is_some()
+        || !host.on(MOD)
+    {
         return;
     }
-    let empty = game
-        .inventory
-        .get(game.selected)
-        .is_none_or(|s| s.as_ref().is_none_or(|s| s.count == 0));
-    if !empty || !state_at(game, pos).is_some_and(|id| is_trunk(game, id)) {
-        return;
-    }
-    let Some(player) = game.native_acting_player() else {
+    let Some(player) = host.player(click.player) else {
         return;
     };
-    with_state(game, |_, st| {
+    let Some(level) = player.level(host) else {
+        return;
+    };
+    if !state_at(host, level, click.pos).is_some_and(|id| is_trunk(host, id)) {
+        return;
+    }
+    let Some(dim) = level.dimension().id(host) else {
+        return;
+    };
+    let (pos, face, uuid) = (click.pos, click.hit.face, click.player);
+    with_state(host, |_, st| {
         if st.config.on(Key::ShakeTree) && st.config.on(Key::Active) {
             st.shakes.push(ShakeReq {
-                dim: player.dimension,
+                dim,
                 pos,
                 face,
-                player: player.uuid,
+                player: uuid,
             });
         }
     });
 }
 
-/// `native_place_block`: logs a player places are remembered and never felled.
-pub(super) fn place(game: &mut Game<'_>, pos: [i32; 3], state: BlockStateId) {
-    if !game.native_on(MOD) || !is_trunk(game, state) {
+/// `entity_place`: logs a player places are remembered and never felled.
+pub(crate) fn place(host: &mut dyn ServerHost, event: &EntityPlaceEvent) {
+    if !host.on(MOD) {
         return;
     }
-    let Some(player) = game.native_acting_player() else {
+    let Some(player) = host.players().acting_player() else {
         return;
     };
-    with_state(game, |_, st| {
-        if st.config.on(Key::Protect) && st.placed.entry(player.dimension).or_default().insert(pos)
-        {
-            st.dirty = true;
+    if event.placer.is_some_and(|e| e != player.entity()) {
+        return;
+    }
+    let mut logs: Vec<Pos> = Vec::new();
+    if is_trunk(host, event.state) {
+        logs.push([event.pos.x, event.pos.y, event.pos.z]);
+    }
+    if let Placement::Multi(blocks) = &event.placement {
+        for b in blocks {
+            let at = [b.pos.x, b.pos.y, b.pos.z];
+            if is_trunk(host, b.state) && !logs.contains(&at) {
+                logs.push(at);
+            }
+        }
+    }
+    if logs.is_empty() {
+        return;
+    }
+    let Some(dim) = dimension_of(host, player) else {
+        return;
+    };
+    with_state(host, |_, st| {
+        if !st.config.on(Key::Protect) {
+            return;
+        }
+        let set = st.placed.entry(dim).or_default();
+        for p in logs {
+            if set.insert(p) {
+                st.dirty = true;
+            }
         }
     });
 }
 
-/// `native_server_tick`.
-pub(super) fn server_tick(game: &mut Game<'_>, phase: ServerTickPhase) {
-    let ServerTickPhase::ServerTickStart { world_running } = phase else {
+/// `server_tick`: the clock, cuts that waited too long, idle trees, saving.
+pub(crate) fn server_tick(
+    host: &mut dyn ServerHost,
+    context: &LifecycleContext,
+    phase: ServerTickPhase,
+) {
+    INTEGRATED.store(
+        matches!(context.authority, Authority::IntegratedServer),
+        Ordering::Relaxed,
+    );
+    let ServerTickPhase::ServerTickStart { world_running, .. } = phase else {
         return;
     };
-    with_state(game, |game, st| {
+    with_state(host, |host, st| {
         st.tick += 1;
         for p in st.pending.iter_mut() {
             p.age += 1;
@@ -1185,7 +1484,7 @@ pub(super) fn server_tick(game: &mut Game<'_>, phase: ServerTickPhase) {
             while i < st.trees.len() {
                 if st.tick.saturating_sub(st.trees[i].last) > IDLE_TICKS {
                     let mut tree = st.trees.remove(i);
-                    end_tree(game, &mut tree);
+                    end_tree(host, &mut tree);
                 } else {
                     i += 1;
                 }
@@ -1203,11 +1502,15 @@ pub(super) fn server_tick(game: &mut Game<'_>, phase: ServerTickPhase) {
     });
 }
 
-/// `native_level_tick_pre`: the level `dimension` is in place. Its trees move a
-/// tick, then the cuts made in it are looked at.
-pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
-    let enabled = game.native_on(MOD);
-    with_state(game, |game, st| {
+/// `level_tick_pre`: the level is in place. Its trees move a tick, then the cuts
+/// made in it are looked at.
+pub(crate) fn level_tick(host: &mut dyn ServerHost, level: LevelRef) {
+    let Some(dimension) = level.dimension().id(host) else {
+        return;
+    };
+    let dimension = dimension.as_str();
+    let enabled = host.on(MOD);
+    with_state(host, |host, st| {
         if !enabled {
             // switched off in Options > Mods: what falls here ends at once
             let (here, rest): (Vec<Falling>, Vec<Falling>) = std::mem::take(&mut st.trees)
@@ -1215,7 +1518,7 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                 .partition(|t| t.dim == dimension);
             st.trees = rest;
             for mut t in here {
-                end_tree(game, &mut t);
+                end_tree(host, &mut t);
             }
             st.pending.retain(|p| p.dim != dimension);
             return;
@@ -1229,7 +1532,7 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                 continue;
             }
             st.trees[i].last = st.tick;
-            let (done, knock) = tick_tree(game, &config, &mut st.rng, &mut st.trees[i]);
+            let (done, knock) = tick_tree(host, level, &config, &mut st.rng, &mut st.trees[i]);
             knocks.extend(knock);
             if done {
                 st.trees.remove(i);
@@ -1238,7 +1541,7 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
             }
         }
         for k in knocks {
-            chain(game, st, dimension, k);
+            chain(host, level, st, dimension, k);
         }
         let mut started = 0;
         let mut j = 0;
@@ -1248,7 +1551,7 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                 continue;
             }
             let p = st.pending.remove(j);
-            match job(game, st, &p) {
+            match job(host, level, st, &p) {
                 Job::Retry => {
                     st.pending.insert(j, p);
                     j += 1;
@@ -1256,8 +1559,8 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
                 Job::Done => started += 1,
             }
         }
-        tick_shakes(game, st, dimension);
-        tick_trembles(game, st, dimension);
+        tick_shakes(host, level, st, dimension);
+        tick_trembles(host, level, st, dimension);
         // displays a crash left behind, while nothing falls
         let last = st.swept.get(dimension).copied();
         if st.trees.is_empty()
@@ -1265,38 +1568,39 @@ pub(super) fn level_tick(game: &mut Game<'_>, dimension: &str) {
             && last.is_none_or(|t| st.tick.saturating_sub(t) >= SWEEP_TICKS)
         {
             st.swept.insert(dimension.to_owned(), st.tick);
-            game.native_run_command(&format!(
+            host.commands().run_command(&format!(
                 "execute in {dimension} run kill @e[type=minecraft:block_display,tag={TAG}]"
             ));
         }
-        game.flush_native_sounds();
     });
 }
 
-/// `native_server_stopping`: what still falls drops at once.
-pub(super) fn stopping(game: &mut Game<'_>) {
-    with_state(game, |game, st| {
+/// `server_started`: a world opened, its data loads.
+pub(crate) fn opened(host: &mut dyn ServerHost) {
+    let Some(world) = host.world_dir() else {
+        return;
+    };
+    let mut slot = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut old) = slot.take() {
+        save(&mut old);
+    }
+    *slot = Some(load(world));
+}
+
+/// `server_stopping`: what still falls drops at once.
+pub(crate) fn stopping(host: &mut dyn ServerHost) {
+    with_state(host, |host, st| {
         for mut t in std::mem::take(&mut st.trees) {
-            end_tree(game, &mut t);
+            end_tree(host, &mut t);
         }
         st.pending.clear();
         save(st);
     });
 }
 
-/// `native_world_lifecycle`: a world opened (its data loads) or closed (saved).
-pub(super) fn lifecycle(game: &mut Game<'_>, phase: WorldPhase) {
+/// `world_lifecycle`: a world closed (or didn't open), its data is saved.
+pub(crate) fn lifecycle(_host: &mut dyn ServerHost, phase: WorldPhase) {
     match phase {
-        WorldPhase::WorldOpenReady => {
-            let Some(world) = game.native_world_dir() else {
-                return;
-            };
-            let mut slot = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(mut old) = slot.take() {
-                save(&mut old);
-            }
-            *slot = Some(load(world));
-        }
         WorldPhase::WorldCloseFinal
         | WorldPhase::WorldCloseFailed
         | WorldPhase::WorldOpenFailed => {
@@ -1305,6 +1609,7 @@ pub(super) fn lifecycle(game: &mut Game<'_>, phase: WorldPhase) {
                 save(&mut old);
             }
         }
+        _ => {}
     }
 }
 
@@ -1318,15 +1623,17 @@ enum Job {
     Retry,
 }
 
-fn action_bar(game: &mut Game<'_>, player: u128, text: &str) {
-    game.native_action_bar(player, span(text, "gold"));
+fn action_bar(host: &mut dyn ServerHost, player: u128, text: &str) {
+    if let Some(p) = host.player(player) {
+        let _ = p.action_bar(host, span(text, "gold"));
+    }
 }
 
 /// Where a felling starts from: a player's cut, or a trunk knocked down.
 struct Start {
     dim: String,
     cut: Pos,
-    cut_state: BlockStateId,
+    cut_state: BlockState,
     /// Which way it should fall (degrees), and how far it may turn from there.
     yaw: f64,
     aim: bool,
@@ -1344,15 +1651,15 @@ struct Start {
     /// A player's own cut out of creative: it tires them (with that setting).
     tired: bool,
     /// The display of the log that trembled as it was dug: it puffs up and pops.
-    ghost: Option<(u32, Pos)>,
+    ghost: Option<(DisplayRef, Pos)>,
     generation: u32,
     /// The cut log is still in the level (a trunk knocked down): it breaks once
     /// the tree behind it is known.
     standing: bool,
 }
 
-fn job(game: &mut Game<'_>, st: &mut State, p: &Pending) -> Job {
-    if state_at(game, p.pos).is_some_and(|id| is_trunk(game, id)) {
+fn job(host: &mut dyn ServerHost, level: LevelRef, st: &mut State, p: &Pending) -> Job {
+    if state_at(host, level, p.pos).is_some_and(|id| is_trunk(host, id)) {
         return Job::Retry;
     }
     // the log that trembled as it was dug, if it did
@@ -1362,31 +1669,45 @@ fn job(game: &mut Game<'_>, st: &mut State, p: &Pending) -> Job {
         .position(|t| t.dim == p.dim && t.pos == p.pos)
         .map(|i| st.trembles.remove(i))
         .and_then(|t| t.display.map(|d| (d, t.face)));
-    if !felled(game, st, p, ghost)
+    if !felled(host, level, st, p, ghost)
         && let Some((d, _)) = ghost
     {
-        game.native_remove_entity(&p.dim, d);
+        remove(host, d);
     }
     Job::Done
 }
 
+/// Whether the game drops what blocks give (the `block_drops` rule).
+fn block_drops(host: &dyn ServerHost) -> bool {
+    !matches!(
+        host.game_rule("minecraft:block_drops"),
+        Ok(GameRuleValue::Bool(false))
+    )
+}
+
 /// Fells the tree of the log `p` broke, when its cutter may: whether it did.
-fn felled(game: &mut Game<'_>, st: &mut State, p: &Pending, ghost: Option<(u32, Pos)>) -> bool {
+fn felled(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    st: &mut State,
+    p: &Pending,
+    ghost: Option<(DisplayRef, Pos)>,
+) -> bool {
     if st.off.contains(&p.player) {
         return false;
     }
-    let Some(who) = cutter(game, p.player) else {
+    let Some(who) = cutter(host, p.player) else {
         return false;
     };
     if who.dim != p.dim {
         return false;
     }
-    let axe = who.held.as_ref().is_some_and(|s| {
-        game.native_server_item_in_tag(s, "minecraft:axes")
-            .unwrap_or(false)
-    });
+    let axe = who
+        .held
+        .as_ref()
+        .is_some_and(|s| item_in_tag(host, s, "minecraft:axes"));
     let config = &st.config;
-    if !core::fells(config, who.game_mode, who.sneaking, axe) {
+    if !rules::fells(config, who.game_mode, who.sneaking, axe) {
         return false;
     }
     let creative = who.game_mode == 1;
@@ -1398,7 +1719,7 @@ fn felled(game: &mut Game<'_>, st: &mut State, p: &Pending, ghost: Option<(u32, 
         aim: config.on(Key::Aim),
         cone: config.get(Key::Cone),
         tool: who.held.clone(),
-        drops: !creative && game.ui.rules.bool("block_drops"),
+        drops: !creative && block_drops(host),
         owner: match config.get(Key::Loot) {
             1 => Some((p.player, false)),
             2 => Some((p.player, true)),
@@ -1412,35 +1733,49 @@ fn felled(game: &mut Game<'_>, st: &mut State, p: &Pending, ghost: Option<(u32, 
         generation: 0,
         standing: false,
     };
-    fell_tree(game, st, start)
+    fell_tree(host, level, st, start)
+}
+
+/// What the block at `p` gives, rolled with `tool`, while it is still there.
+fn loot_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    p: Pos,
+    tool: Option<&ItemStack>,
+) -> Vec<ItemStack> {
+    level
+        .block_drops(host, p, tool, None)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Reads the tree behind `s.cut`, takes it out of the level and starts its fall:
 /// false when there is no tree to fell there.
-fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
+fn fell_tree(host: &mut dyn ServerHost, level: LevelRef, st: &mut State, s: Start) -> bool {
     let config = st.config.clone();
-    let cut_name = name_of(game, s.cut_state);
+    let cut_name = name_of(host, s.cut_state);
     let tree = {
         let placed = st.placed.get(&s.dim);
         let protect = config.on(Key::Protect);
         let is_placed = |q: Pos| protect && placed.is_some_and(|set| set.contains(&q));
-        let mut reader = Reader::new(game, &config);
+        let mut reader = Reader::new(host, level, &config);
         let wood = reader.wood(&cut_name);
-        let mut look = core::Look::new(&mut reader);
-        core::scan(
+        let mut look = rules::Look::new(&mut reader);
+        rules::scan(
             &mut look,
             &is_placed,
             s.cut,
             wood,
-            &core::Limits::of(&config),
+            &rules::Limits::of(&config),
         )
     };
     let tree = match tree {
         Ok(t) => t,
-        Err(core::Refusal::TooBig) => {
+        Err(rules::Refusal::TooBig) => {
             if let Some((uuid, _)) = &s.cutter {
                 action_bar(
-                    game,
+                    host,
                     *uuid,
                     "🪓 Chop! Cet arbre est trop grand : il se coupe bûche par bûche.",
                 );
@@ -1454,24 +1789,24 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     if s.wear
         && let Some((uuid, name)) = &s.cutter
         && let Some(stack) = &s.tool
-        && let Some(max) = max_damage(game, stack)
+        && let Some(max) = max_damage(host, stack)
     {
-        let n = core::wear(
+        let n = rules::wear(
             tree.logs.len() as u32,
-            stack.enchantment_level("minecraft:unbreaking"),
+            enchantment(stack, "minecraft:unbreaking"),
             &mut st.rng,
         );
-        let after = stack.damage + n;
+        let after = stack.damage() + n;
         if after >= max {
             action_bar(
-                game,
+                host,
                 *uuid,
                 &format!("🪓 Chop! Ta hache est trop usée pour cet arbre ({n} points de plus)."),
             );
             return false;
         }
         if n > 0 {
-            game.native_run_command(&format!(
+            host.commands().run_command(&format!(
                 "item modify entity {name} weapon.mainhand {{type:\"minecraft:set_components\",components:{{\"minecraft:damage\":{after}}}}}"
             ));
         }
@@ -1483,40 +1818,40 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     // a trunk knocked down breaks at its foot
     if s.standing {
         let items = if s.drops {
-            game.block_loot_at(s.cut, s.cut_state, s.tool.as_ref())
+            loot_at(host, level, s.cut, s.tool.as_ref())
         } else {
             Vec::new()
         };
-        clear(game, &dim, s.cut, s.cut_state, NORMAL);
-        block_bits(game, &config, s.cut_state, cut, 10.0);
+        clear(host, level, s.cut, s.cut_state, normal());
+        block_bits(host, level, &config, s.cut_state, cut, 10.0);
         for item in items {
-            drop_item(game, &mut st.rng, cut, item, s.owner);
+            drop_item(host, level, &mut st.rng, cut, item, s.owner);
         }
     }
 
     // which way, how far, what it crushes, whose trunks it comes down on
     let animate = config.on(Key::Animation);
     let (body, contact, crush, hits) = {
-        let mut reader = Reader::new(game, &config);
-        let mut look = core::Look::new(&mut reader);
+        let mut reader = Reader::new(host, level, &config);
+        let mut look = rules::Look::new(&mut reader);
         let sink = if animate {
-            core::gap(&mut look, &tree)
+            rules::gap(&mut look, &tree)
         } else {
             0.0
         };
         let dir = if animate {
-            core::choose_dir(&tree, &mut look, s.yaw, s.aim, s.cone, sink)
+            rules::choose_dir(&tree, &mut look, s.yaw, s.aim, s.cone, sink)
         } else {
-            core::yaw_dir(s.yaw)
+            rules::yaw_dir(s.yaw)
         };
-        let body = core::Body::new(&tree, dir, sink);
+        let body = rules::Body::new(&tree, dir, sink);
         if animate {
             let contact = body.contact(&mut look, true);
             let crush = body.crush(&mut look, contact.theta);
             let hits = log_hits(&mut look, &contact);
             (body, contact, crush, hits)
         } else {
-            let none = core::Contact {
+            let none = rules::Contact {
                 theta: 0.0,
                 ground: true,
                 points: Vec::new(),
@@ -1529,30 +1864,38 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     let mut states = Vec::with_capacity(body.parts.len());
     let mut loot = Vec::with_capacity(body.parts.len());
     for part in &body.parts {
-        let id = state_at(game, part.cell).unwrap_or(s.cut_state);
+        let id = state_at(host, level, part.cell).unwrap_or(s.cut_state);
         states.push(id);
         loot.push(if s.drops {
-            game.block_loot_at(part.cell, id, s.tool.as_ref())
+            loot_at(host, level, part.cell, s.tool.as_ref())
         } else {
             Vec::new()
         });
     }
-    let contacts = dust_points(game, &contact);
+    let contacts = dust_points(host, level, &contact);
     let leaf = body
         .parts
         .iter()
         .position(|part| part.leaf)
-        .map(|i| name_of(game, states[i]));
+        .map(|i| name_of(host, states[i]));
 
-    let tint = tint_for(game, leaf.as_deref(), s.cut);
-    credit_felling(st, &config, &s, &tree);
+    let tint = tint_for(host, level, leaf.as_deref(), s.cut);
+    credit_felling(st, &s, &tree);
+    if s.tired
+        && config.on(Key::Fatigue)
+        && let Some((uuid, _)) = &s.credit
+        && let Some(p) = host.player(*uuid)
+    {
+        // felling makes the lumberjack a little hungry
+        p.add_exhaustion(host, 0.15 * tree.logs.len() as f32);
+    }
 
     // what hangs on it: its loot too
     let mut hung = Vec::with_capacity(tree.hangers.len());
     for h in &tree.hangers {
-        if let Some(id) = state_at(game, *h) {
+        if let Some(id) = state_at(host, level, *h) {
             let items = if s.drops {
-                game.block_loot_at(*h, id, s.tool.as_ref())
+                loot_at(host, level, *h, s.tool.as_ref())
             } else {
                 Vec::new()
             };
@@ -1561,7 +1904,8 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     }
     // the saplings that go back where it stood
     let replanting = plan_replant(
-        game,
+        host,
+        level,
         &config,
         &tree,
         &cut_name,
@@ -1572,56 +1916,63 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     );
 
     // what hangs on it breaks off first
-    let silk = s
-        .tool
+    // the player a nest's bees come out for: its feller, here and breaking blocks as
+    // survival players do (a creative player's break keeps them in, as in vanilla)
+    let lumberjack = s
+        .credit
         .as_ref()
-        .is_some_and(|t| t.enchantment_level("minecraft:silk_touch") > 0);
+        .and_then(|(uuid, _)| host.player(*uuid))
+        .filter(|p| p.level(host) == Some(level))
+        .filter(|p| {
+            matches!(
+                p.game_mode(host),
+                Some(GameMode::Survival | GameMode::Adventure)
+            )
+        });
     for (n, (h, id, items)) in hung.into_iter().enumerate() {
         let at = center(h);
-        let nest = matches!(
-            name_of(game, id).as_str(),
-            "minecraft:bee_nest" | "minecraft:beehive"
-        );
+        let name = name_of(host, id);
+        let nest = matches!(name.as_str(), "minecraft:bee_nest" | "minecraft:beehive");
         if nest
-            && !silk
             && config.on(Key::Bees)
-            && let Some((_, facing)) = game.hive_state(h)
+            && let Some(p) = lumberjack
+            && p.destroy_block(host, h, matches!(s.owner, Some((_, true))))
         {
-            // its bees come out, angry, as when a player breaks it
-            game.empty_hive(h, facing, horizon_client::beehive::Release::Emergency);
-            game.anger_nearby_bees(h);
+            // broken as the player breaks it: without Silk Touch its bees come out,
+            // angry, as in vanilla; its loot is the game's
+            continue;
         }
-        clear(game, &dim, h, id, NORMAL);
-        block_bits(game, &config, id, at, 4.0);
+        clear(host, level, h, id, normal());
+        block_bits(host, level, &config, id, at, 4.0);
         if n < 3 {
-            let name = name_of(game, id);
-            sound(game, &config, break_sound(&name), at, 0.6, 1.2);
+            sound(host, level, &config, break_sound(&name), at, 0.6, 1.2);
         }
         for item in items {
-            drop_item(game, &mut st.rng, at, item, None);
+            drop_item(host, level, &mut st.rng, at, item, None);
         }
     }
     // then the tree leaves the level, leaves first
     for i in (0..body.parts.len()).rev() {
         let part = &body.parts[i];
-        let flags = if part.surface { NORMAL } else { QUIET };
-        clear(game, &dim, part.cell, states[i], flags);
+        let flags = if part.surface { normal() } else { quiet() };
+        clear(host, level, part.cell, states[i], flags);
     }
 
     if !animate {
         if let Some((ghost, _)) = s.ghost {
-            game.native_remove_entity(&dim, ghost);
+            remove(host, ghost);
         }
         // everything breaks where it stood, with a little tune
         let every = (body.parts.len() / 150).max(1);
         for (i, part) in body.parts.iter().enumerate() {
             let at = center(part.cell);
             if i % every == 0 {
-                block_bits(game, &config, states[i], at, 3.0);
+                block_bits(host, level, &config, states[i], at, 3.0);
                 particles(
-                    game,
+                    host,
+                    level,
                     &config,
-                    ParticleOptions::simple(ParticleType::Poof),
+                    Fx::Poof,
                     None,
                     at,
                     [0.2, 0.2, 0.2],
@@ -1630,18 +1981,26 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
                 );
             }
             for item in std::mem::take(&mut loot[i]) {
-                drop_item(game, &mut st.rng, at, item, s.owner);
+                drop_item(host, level, &mut st.rng, at, item, s.owner);
             }
         }
-        sound(game, &config, CRACK, cut, 0.9, 0.8);
+        sound(host, level, &config, CRACK, cut, 0.9, 0.8);
         if let Some(l) = &leaf {
-            sound(game, &config, break_sound(l), cut, 0.8, 0.9);
+            sound(host, level, &config, break_sound(l), cut, 0.8, 0.9);
         }
-        sound(game, &config, PLOP, cut, 0.9, 1.2);
-        sound(game, &config, BUBBLE, cut, 0.8, 1.0);
-        sound(game, &config, BUBBLE, cut, 0.6, 1.4);
+        sound(host, level, &config, PLOP, cut, 0.9, 1.2);
+        sound(host, level, &config, BUBBLE, cut, 0.8, 1.0);
+        sound(host, level, &config, BUBBLE, cut, 0.6, 1.4);
         if let Some((sapling, spots, from_loot)) = replanting {
-            replant(game, &config, &mut st.rng, &dim, sapling, &spots, from_loot);
+            replant(
+                host,
+                level,
+                &config,
+                &mut st.rng,
+                sapling,
+                &spots,
+                from_loot,
+            );
         }
         return true;
     }
@@ -1655,19 +2014,27 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
         // where the block stood: the body is planned dropped, it shows upright first
         let tr = [0, 1, 2].map(|k| (f64::from(part.cell[k]) - anchor[k]) as f32);
         ents.push(summon_display(
-            game, &dim, anchor, states[i], tr, 1.0, st.session, id,
+            host, &dim, anchor, states[i], tr, 1.0, st.session, id,
         ));
     }
     let ghost = s.ghost.map(|(ghost, face)| {
         // the log that trembled swells one last time; it pops on the next tick
-        let (tr, scale) = core::tremble_pose(0, 1.0, face);
+        let (tr, scale) = rules::tremble_pose(0, 1.0, face);
         let tr = tr.map(|v| v - 0.06);
-        pose_scaled(game, ghost, tr, [0.0, 0.0, 0.0, 1.0], scale + 0.12);
+        pose(host, ghost, tr, [0.0, 0.0, 0.0, 1.0], scale + 0.12);
         ghost
     });
     if ghost.is_none() {
         // cut in one blow, or pushed over: it goes at once
-        sound(game, &config, "minecraft:block.wood.hit", cut, 0.6, 1.3);
+        sound(
+            host,
+            level,
+            &config,
+            "minecraft:block.wood.hit",
+            cut,
+            0.6,
+            1.3,
+        );
     }
     let tip = (0..body.parts.len())
         .max_by(|a, b| body.parts[*a].r.total_cmp(&body.parts[*b].r))
@@ -1679,18 +2046,23 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     let leaves: Vec<usize> = (0..body.parts.len())
         .filter(|i| body.parts[*i].leaf)
         .collect();
-    let motion = core::Motion::new(&body, &contact, config.get(Key::Speed));
+    let motion = rules::Motion::new(&body, &contact, config.get(Key::Speed));
     let lie = (config.get(Key::Rest) * 2).max(0) as u32;
     // the apples come loose as it goes
     let mut apples = Vec::new();
-    if config.on(Key::Apples) {
+    if config.on(Key::Apples)
+        && let Some(apple) = Identifier::parse("minecraft:apple")
+            .ok()
+            .and_then(|id| host.item_key(&id))
+    {
         for &i in &leaves {
-            for stack in loot[i].iter_mut() {
-                if &*stack.item == "minecraft:apple" && stack.count > 0 {
-                    let when = 3 + st.rng.below(10);
-                    apples.push((i, stack.clone(), when));
-                    stack.count = 0;
-                }
+            let (fruit, kept): (Vec<ItemStack>, Vec<ItemStack>) = std::mem::take(&mut loot[i])
+                .into_iter()
+                .partition(|stack| stack.item() == apple);
+            loot[i] = kept;
+            for stack in fruit {
+                let when = 3 + st.rng.below(10);
+                apples.push((i, stack, when));
             }
         }
     }
@@ -1698,7 +2070,7 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
         id,
         dim,
         owner: s.owner,
-        fell: core::Fell::new(body, motion, crush, lie, false, config.get(Key::Speed)),
+        fell: rules::Fell::new(body, motion, crush, lie, false, config.get(Key::Speed)),
         ents,
         states,
         loot,
@@ -1731,8 +2103,8 @@ fn fell_tree(game: &mut Game<'_>, st: &mut State, s: Start) -> bool {
     true
 }
 
-/// A felling counts in its feller's stats; a player's own cut also tires them.
-fn credit_felling(st: &mut State, config: &Config, s: &Start, tree: &core::Tree) {
+/// A felling counts in its feller's stats.
+fn credit_felling(st: &mut State, s: &Start, tree: &rules::Tree) {
     let Some((uuid, name)) = &s.credit else {
         return;
     };
@@ -1744,14 +2116,10 @@ fn credit_felling(st: &mut State, config: &Config, s: &Start, tree: &core::Tree)
     stats.biggest = stats.biggest.max(tree.blocks() as u64 + 1);
     stats.chain = stats.chain.max(s.generation);
     st.dirty = true;
-    if s.tired && config.on(Key::Fatigue) {
-        *st.fatigue.entry(*uuid).or_default() += 0.15 * tree.logs.len() as f32;
-        TIRED.store(true, Ordering::Relaxed);
-    }
 }
 
 /// The logs of other trees among the cells the trunk touches.
-fn log_hits(look: &mut core::Look<'_>, contact: &core::Contact) -> Vec<Pos> {
+fn log_hits(look: &mut rules::Look<'_>, contact: &rules::Contact) -> Vec<Pos> {
     let mut out: Vec<Pos> = Vec::new();
     for (_, cell) in &contact.points {
         if matches!(look.cell(*cell), Some(Cell::Log { .. })) && !out.contains(cell) {
@@ -1762,65 +2130,66 @@ fn log_hits(look: &mut core::Look<'_>, contact: &core::Contact) -> Vec<Pos> {
 }
 
 /// Up to ten points where the trunk touches, with the block there (its dust).
-fn dust_points(game: &Game<'_>, contact: &core::Contact) -> Vec<([f64; 3], BlockStateId)> {
+fn dust_points(
+    host: &dyn Host,
+    level: LevelRef,
+    contact: &rules::Contact,
+) -> Vec<([f64; 3], BlockState)> {
     contact
         .points
         .iter()
         .step_by((contact.points.len() / 10).max(1))
-        .filter_map(|(w, c)| state_at(game, *c).map(|s| (*w, s)))
+        .filter_map(|(w, c)| state_at(host, level, *c).map(|s| (*w, s)))
         .collect()
 }
 
 /// Takes the block at `p` out of the level (water stays where it was waterlogged).
-fn clear(game: &mut Game<'_>, dim: &str, p: Pos, id: BlockStateId, flags: i32) {
-    let wet = prop(game, id, "waterlogged").as_deref() == Some("true");
-    let registry = game.pack.assets.registry;
-    let Some(left) = registry.default_state(if wet {
+fn clear(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    p: Pos,
+    id: BlockState,
+    flags: BlockUpdateFlags,
+) {
+    let wet = prop(host, id, "waterlogged").as_deref() == Some("true");
+    let Some(left) = host.block_state_id(if wet {
         "minecraft:water"
     } else {
         "minecraft:air"
     }) else {
         return;
     };
-    game.native_set_block(dim, p, left, flags);
+    let _ = level.set_block(host, p, left, flags);
 }
 
 /// An item pops out at `at`; or, for an `owner` in this level, goes into their
-/// inventory (what doesn't fit at their feet) or straight to their feet.
+/// inventory (what doesn't fit drops from them) or straight to their feet.
 fn drop_item(
-    game: &mut Game<'_>,
-    rng: &mut core::Rng,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    rng: &mut rules::Rng,
     at: [f64; 3],
     item: ItemStack,
     owner: Owner,
 ) {
-    if item.count == 0 {
-        return;
-    }
-    let mut item = item;
     if let Some((o, bag)) = owner
-        && let Some(p) = game
-            .native_server_players()
-            .into_iter()
-            .find(|p| p.uuid == o && p.dimension == game.dim.id())
+        && let Some(p) = host.player(o)
+        && p.level(host) == Some(level)
+        && let Some(feet) = p.entity().position(host)
     {
-        if bag {
-            match game.native_give_stack(o, item) {
-                None => return,
-                Some(left) => item = left,
-            }
+        if bag && p.give_stack(host, item.clone()).is_ok() {
+            return;
         }
-        game.spawn_item(item, p.position, [0.0; 3], 0);
+        let _ = level.spawn_item_with_motion(host, feet[0], feet[1], feet[2], item, [0.0; 3], 0);
         return;
     }
-    let at = free_spot(game, at);
+    let at = free_spot(host, level, at);
     let v = [rng.spread(0.08), 0.12 + rng.unit() * 0.1, rng.spread(0.08)];
-    game.spawn_item(item, at, v, 10);
+    let _ = level.spawn_item_with_motion(host, at[0], at[1], at[2], item, v, 10);
 }
 
 /// `at`, or just above it when it is inside a solid block.
-fn free_spot(game: &Game<'_>, at: [f64; 3]) -> [f64; 3] {
-    let b = game.res.behaviours();
+fn free_spot(host: &dyn Host, level: LevelRef, at: [f64; 3]) -> [f64; 3] {
     let mut p = at;
     for _ in 0..3 {
         let cell = [
@@ -1828,8 +2197,10 @@ fn free_spot(game: &Game<'_>, at: [f64; 3]) -> [f64; 3] {
             p[1].floor() as i32,
             p[2].floor() as i32,
         ];
-        let solid = state_at(game, cell)
-            .is_some_and(|id| b.collision_shape(id).is_none_or(|s| !s.is_empty()) && !b.is_air(id));
+        let solid = state_at(host, level, cell).is_some_and(|id| {
+            !is_air(&name_of(host, id))
+                && collision(host, level, id, cell).is_none_or(|s| !s.is_empty())
+        });
         if !solid {
             return p;
         }
@@ -1844,34 +2215,38 @@ fn free_spot(game: &Game<'_>, at: [f64; 3]) -> [f64; 3] {
 
 /// Whether the block under `p` takes `sapling` (dirt, grass, podzol, moss, mud...;
 /// clay too for a propagule).
-fn ground_ok(game: &Game<'_>, p: Pos, sapling: &str) -> bool {
-    let Some(below) = state_at(game, [p[0], p[1] - 1, p[2]]) else {
+fn ground_ok(host: &dyn Host, level: LevelRef, p: Pos, sapling: &str) -> bool {
+    let Some(below) = state_at(host, level, [p[0], p[1] - 1, p[2]]) else {
         return false;
     };
-    let name = name_of(game, below);
+    let name = name_of(host, below);
     if sapling.ends_with("_mushroom") {
         // a mushroom keeps to mycelium, podzol and nylium (the tag's name in 26.3,
         // and its name before)
-        return in_tag(game, below, "minecraft:overrides_mushroom_light_requirement")
-            || in_tag(game, below, "minecraft:mushroom_grow_block");
+        return in_tag(
+            host,
+            below,
+            "minecraft:overrides_mushroom_light_requirement",
+        ) || in_tag(host, below, "minecraft:mushroom_grow_block");
     }
     let fungus = sapling.ends_with("_fungus")
-        && (in_tag(game, below, "minecraft:nylium")
+        && (in_tag(host, below, "minecraft:nylium")
             || name == "minecraft:mycelium"
             || name == "minecraft:soul_soil");
     fungus
-        || in_tag(game, below, "minecraft:dirt")
-        || in_tag(game, below, "minecraft:supports_vegetation")
+        || in_tag(host, below, "minecraft:dirt")
+        || in_tag(host, below, "minecraft:supports_vegetation")
         || name == "minecraft:farmland"
         || (sapling.ends_with("propagule") && name == "minecraft:clay")
 }
 
 /// Whether `p` has room for `sapling`: air, or water for a propagule.
-fn room_for(game: &Game<'_>, p: Pos, sapling: &str) -> Option<bool> {
-    let here = state_at(game, p)?;
-    if game.res.behaviours().is_air(here) {
+fn room_for(host: &dyn Host, level: LevelRef, p: Pos, sapling: &str) -> Option<bool> {
+    let here = state_at(host, level, p)?;
+    let name = name_of(host, here);
+    if is_air(&name) {
         Some(false)
-    } else if sapling.ends_with("propagule") && name_of(game, here) == "minecraft:water" {
+    } else if sapling.ends_with("propagule") && name == "minecraft:water" {
         Some(true)
     } else {
         None
@@ -1884,97 +2259,96 @@ fn room_for(game: &Game<'_>, p: Pos, sapling: &str) -> Option<bool> {
 /// place); without loot (creative, no block drops) they are given.
 #[allow(clippy::too_many_arguments)]
 fn plan_replant(
-    game: &Game<'_>,
+    host: &dyn Host,
+    level: LevelRef,
     config: &Config,
-    tree: &core::Tree,
+    tree: &rules::Tree,
     cut_name: &str,
     leaf: Option<&str>,
     drops: bool,
     loot: &mut [Vec<ItemStack>],
-    hung: &mut [(Pos, BlockStateId, Vec<ItemStack>)],
+    hung: &mut [(Pos, BlockState, Vec<ItemStack>)],
 ) -> Option<(&'static str, Vec<Pos>, bool)> {
     let mode = config.get(Key::Replant);
     if mode == 0 {
         return None;
     }
-    let sapling = core::sapling(species(cut_name), leaf)?;
+    let sapling = rules::sapling(species(cut_name), leaf)?;
     let mut spots: Vec<Pos> = tree
         .spots()
         .into_iter()
-        .filter(|p| ground_ok(game, *p, sapling))
+        .filter(|p| ground_ok(host, level, *p, sapling))
         .collect();
     // a fungus never drops its own: the wart's tree gives it back free
     let from_loot = mode == 1 && drops && !sapling.ends_with("_fungus");
     if from_loot {
+        let key = Identifier::parse(sapling)
+            .ok()
+            .and_then(|id| host.item_key(&id));
         let mut have = 0;
-        let stacks = loot
-            .iter_mut()
-            .flatten()
-            .chain(hung.iter_mut().flat_map(|h| h.2.iter_mut()));
-        for stack in stacks {
-            if have == spots.len() {
-                break;
-            }
-            if &*stack.item == sapling && stack.count > 0 {
-                let take = (spots.len() - have).min(stack.count as usize);
-                stack.count -= take as u32;
+        let lists = loot.iter_mut().chain(hung.iter_mut().map(|h| &mut h.2));
+        for list in lists {
+            list.retain_mut(|stack| {
+                if have == spots.len() || Some(stack.item()) != key {
+                    return true;
+                }
+                let take = (spots.len() - have).min(stack.count() as usize);
                 have += take;
-            }
+                let left = stack.count() - take as u32;
+                left > 0 && stack.set_count(left).is_ok()
+            });
         }
         spots.truncate(have);
     }
-    log::debug!("Chop!: replant {sapling} at {spots:?} (from the loot: {from_loot})");
     (!spots.is_empty()).then_some((sapling, spots, from_loot))
 }
 
 /// Plants `sapling` at each of `spots` still free on soil, with a little pop and
 /// green sparkles; one that came out of the loot and has no room drops there.
 fn replant(
-    game: &mut Game<'_>,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
     config: &Config,
-    rng: &mut core::Rng,
-    dim: &str,
+    rng: &mut rules::Rng,
     sapling: &'static str,
     spots: &[Pos],
     from_loot: bool,
 ) {
-    let registry = game.pack.assets.registry;
-    let Some(plain) = registry.default_state(sapling) else {
-        log::warn!("Chop!: no block {sapling} to replant");
+    let Some(plain) = host.block_state_id(sapling) else {
+        eprintln!("Chop!: no block {sapling} to replant");
         return;
     };
     for p in spots {
         let at = [0, 1, 2].map(|k| f64::from(p[k]) + 0.5);
-        let wet = room_for(game, *p, sapling).filter(|_| ground_ok(game, *p, sapling));
-        log::debug!(
-            "Chop!: planting {sapling} at {p:?}: room {:?}, ground {}",
-            room_for(game, *p, sapling),
-            ground_ok(game, *p, sapling)
-        );
+        let wet =
+            room_for(host, level, *p, sapling).filter(|_| ground_ok(host, level, *p, sapling));
         let Some(wet) = wet else {
-            if from_loot {
-                let item = ItemStack {
-                    item: sapling.into(),
-                    count: 1,
-                    damage: 0,
-                    extra: None,
-                };
-                drop_item(game, rng, at, item, None);
+            if from_loot && let Some(item) = stack_of(host, sapling) {
+                drop_item(host, level, rng, at, item, None);
             }
             continue;
         };
         let state = if wet {
-            with_prop(game, plain, "waterlogged", "true").unwrap_or(plain)
+            with_prop(host, plain, "waterlogged", "true").unwrap_or(plain)
         } else {
             plain
         };
-        game.native_set_block(dim, *p, state, NORMAL);
-        sound(game, config, "minecraft:block.grass.place", at, 0.8, 1.2);
-        sound(game, config, BUBBLE, at, 0.4, 1.6);
-        particles(
-            game,
+        let _ = level.set_block(host, *p, state, normal());
+        sound(
+            host,
+            level,
             config,
-            ParticleOptions::simple(ParticleType::HappyVillager),
+            "minecraft:block.grass.place",
+            at,
+            0.8,
+            1.2,
+        );
+        sound(host, level, config, BUBBLE, at, 0.4, 1.6);
+        particles(
+            host,
+            level,
+            config,
+            Fx::HappyVillager,
             None,
             at,
             [0.3, 0.3, 0.3],
@@ -1984,23 +2358,14 @@ fn replant(
     }
 }
 
-/// The state `id` with property `key` set to `value`.
-fn with_prop(game: &Game<'_>, id: BlockStateId, key: &str, value: &str) -> Option<BlockStateId> {
-    let registry = game.pack.assets.registry;
-    let mut state = registry.state(id)?.clone();
-    let slot = state.properties.get_mut(key)?;
-    *slot = value.into();
-    registry.id(&state)
-}
-
 // ---------------------------------------------------------------------------------
 // A log being dug
 // ---------------------------------------------------------------------------------
 
-/// The logs being dug in the level `dim` tremble a tick: harder as the dig goes
-/// on, with a little knock, a few chips and leaves shivering off the crown. One
-/// that broke waits a few ticks for its felling to take it; one let go stops.
-fn tick_trembles(game: &mut Game<'_>, st: &mut State, dim: &str) {
+/// The logs being dug in the level `dim` tremble a tick: harder as the crack grows,
+/// with a little knock, a few chips and leaves shivering off the crown. One that
+/// broke waits a few ticks for its felling to take it; one let go stops.
+fn tick_trembles(host: &mut dyn ServerHost, level: LevelRef, st: &mut State, dim: &str) {
     let config = st.config.clone();
     let mut i = 0;
     while i < st.trembles.len() {
@@ -2010,18 +2375,22 @@ fn tick_trembles(game: &mut Game<'_>, st: &mut State, dim: &str) {
         }
         st.trembles[i].age += 1;
         let t = &st.trembles[i];
-        let standing = state_at(game, t.pos) == Some(t.state);
+        let standing = state_at(host, level, t.pos) == Some(t.state);
         let done = if !standing {
             st.trembles[i].broken += 1;
             st.trembles[i].broken > 3
+        } else if t.shaking {
+            t.stopped || t.age > t.ticks
         } else {
-            let slack = if t.shaking { 0 } else { 20 };
-            t.stopped || t.age > t.ticks + slack || !(config.on(Key::Shake) || t.shaking)
+            t.stopped
+                || !config.on(Key::Shake)
+                || (t.stage.is_none() && t.age > DIG_START)
+                || t.age.saturating_sub(t.staged_at) > DIG_STALL
         };
         if done {
             let t = st.trembles.remove(i);
             if let Some(d) = t.display {
-                game.native_remove_entity(&t.dim, d);
+                remove(host, d);
             }
             continue;
         }
@@ -2030,7 +2399,23 @@ fn tick_trembles(game: &mut Game<'_>, st: &mut State, dim: &str) {
             continue;
         }
         if !st.trembles[i].checked {
-            match tremble_start(game, st, i) {
+            let t = &st.trembles[i];
+            if !t.shaking {
+                match t.first_stage {
+                    // the dig hasn't shown yet
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                    // it breaks in a tick or two: nothing to shake
+                    Some(s) if s >= 5 => {
+                        st.trembles.remove(i);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            match tremble_start(host, level, st, i) {
                 Some(setup) => {
                     let t = &mut st.trembles[i];
                     t.checked = true;
@@ -2049,13 +2434,11 @@ fn tick_trembles(game: &mut Game<'_>, st: &mut State, dim: &str) {
         let strength = if t.shaking {
             0.6
         } else {
-            f64::from(t.age) / f64::from(t.ticks.max(1))
+            ((f64::from(t.stage.unwrap_or(0)) + 1.0) / 10.0).min(1.0)
         };
         // where it will fall, for the players who want to see it
         if t.age % 4 == 1 && !t.preview.is_empty() {
-            let mut dust = ParticleOptions::simple(ParticleType::Dust);
-            dust.color = [1.0, 0.85, 0.35, 1.0];
-            dust.scale = 0.9;
+            let dust = Fx::Dust([1.0, 0.85, 0.35], 0.9);
             let points = t.preview.clone();
             let world = config.on(Key::Preview);
             let want = move |u: u128| match perso_of(u).preview {
@@ -2064,9 +2447,10 @@ fn tick_trembles(game: &mut Game<'_>, st: &mut State, dim: &str) {
             };
             for at in points {
                 particles_to(
-                    game,
+                    host,
+                    level,
                     &config,
-                    dust.clone(),
+                    dust,
                     None,
                     at,
                     [0.15, 0.0, 0.15],
@@ -2078,53 +2462,62 @@ fn tick_trembles(game: &mut Game<'_>, st: &mut State, dim: &str) {
         }
         let t = &st.trembles[i];
         if let Some(d) = t.display {
-            let (tr, scale) = core::tremble_pose(t.age, strength, t.face);
-            pose_scaled(game, d, tr, [0.0, 0.0, 0.0, 1.0], scale);
+            let (tr, scale) = rules::tremble_pose(t.age, strength, t.face);
+            pose(host, d, tr, [0.0, 0.0, 0.0, 1.0], scale);
         }
-        let face_at = [0, 1, 2].map(|k| f64::from(t.pos[k]) + 0.5 + 0.55 * f64::from(t.face[k]));
-        if t.age % 2 == 0 {
-            let pitch = if t.age % 4 == 0 { 1.5 } else { 1.7 } + 0.2 * strength;
+        let t = &st.trembles[i];
+        let (age, shaking, state, face_at) = (
+            t.age,
+            t.shaking,
+            t.state,
+            [0, 1, 2].map(|k| f64::from(t.pos[k]) + 0.5 + 0.55 * f64::from(t.face[k])),
+        );
+        if age % 2 == 0 {
+            let pitch = if age % 4 == 0 { 1.5 } else { 1.7 } + 0.2 * strength;
             sound(
-                game,
+                host,
+                level,
                 &config,
                 "minecraft:block.wood.hit",
                 face_at,
                 0.3,
                 pitch,
             );
-            block_bits(game, &config, t.state, face_at, 2.0);
+            block_bits(host, level, &config, state, face_at, 2.0);
         }
-        if t.age % 3 == 0 && !t.leaves.is_empty() {
+        let t = &st.trembles[i];
+        if age % 3 == 0 && !t.leaves.is_empty() {
             let leaf = t.leaves[st.rng.below(t.leaves.len() as u32) as usize];
-            if let Some(id) = state_at(game, leaf) {
-                let name = name_of(game, id);
+            let tint = t.tint;
+            if let Some(id) = state_at(host, level, leaf) {
+                let name = name_of(host, id);
                 let at = [0, 1, 2].map(|k| f64::from(leaf[k]) + 0.5);
-                if let Some(o) = leaf_particle(&name, t.tint) {
+                if let Some(fx) = leaf_particle(&name, tint) {
                     particles(
-                        game,
+                        host,
+                        level,
                         &config,
-                        o,
+                        fx,
                         None,
                         [at[0], at[1] - 0.6, at[2]],
                         [0.4, 0.1, 0.4],
                         0.0,
-                        if t.shaking { 3.0 } else { 1.0 },
+                        if shaking { 3.0 } else { 1.0 },
                     );
                 }
-                if t.age % 6 == 0 {
-                    sound(game, &config, step_sound(&name), at, 0.3, 1.1);
+                if age % 6 == 0 {
+                    sound(host, level, &config, step_sound(&name), at, 0.3, 1.1);
                 }
             }
         }
         i += 1;
     }
-    TREMBLING.store(!st.trembles.is_empty(), Ordering::Relaxed);
 }
 
 /// Trees shaken by hand in the level `dim`: the trunk shivers, leaves flutter
 /// down and a few of what leaves give (sticks, saplings, apples) fall out; a
 /// tree gives once every 30 seconds.
-fn tick_shakes(game: &mut Game<'_>, st: &mut State, dim: &str) {
+fn tick_shakes(host: &mut dyn ServerHost, level: LevelRef, st: &mut State, dim: &str) {
     if st.shakes.is_empty() {
         return;
     }
@@ -2139,25 +2532,25 @@ fn tick_shakes(game: &mut Game<'_>, st: &mut State, dim: &str) {
             continue;
         }
         st.shook.insert(r.player, st.tick);
-        let Some((base, base_state)) = trunk_base(game, r.pos) else {
+        let Some((base, base_state)) = trunk_base(host, level, r.pos) else {
             continue;
         };
-        let Some(state) = state_at(game, r.pos) else {
+        let Some(state) = state_at(host, level, r.pos) else {
             continue;
         };
         let tree = {
             let placed = st.placed.get(dim);
             let protect = config.on(Key::Protect);
             let is_placed = |q: Pos| protect && placed.is_some_and(|set| set.contains(&q));
-            let mut reader = Reader::new(game, &config);
-            let wood = reader.wood(&name_of(game, base_state));
-            let mut look = core::Look::new(&mut reader);
-            core::scan(
+            let mut reader = Reader::new(host, level, &config);
+            let wood = reader.wood(&name_of(host, base_state));
+            let mut look = rules::Look::new(&mut reader);
+            rules::scan(
                 &mut look,
                 &is_placed,
                 base,
                 wood,
-                &core::Limits::of(&config),
+                &rules::Limits::of(&config),
             )
         };
         let Ok(tree) = tree else {
@@ -2180,18 +2573,28 @@ fn tick_shakes(game: &mut Game<'_>, st: &mut State, dim: &str) {
             shaking: true,
             tint: None,
             preview: Vec::new(),
+            stage: None,
+            first_stage: None,
+            staged_at: 0,
         });
-        TREMBLING.store(true, Ordering::Relaxed);
         let leaf_name = tree
             .leaves
             .first()
-            .and_then(|p| state_at(game, *p))
-            .map(|id| name_of(game, id));
+            .and_then(|p| state_at(host, level, *p))
+            .map(|id| name_of(host, id));
         if let Some(l) = &leaf_name {
             for k in 0..2.min(tree.leaves.len()) {
                 let p = tree.leaves[(k * 7) % tree.leaves.len()];
                 let at = [0, 1, 2].map(|i| f64::from(p[i]) + 0.5);
-                sound(game, &config, step_sound(l), at, 0.7, 0.9 + 0.2 * k as f64);
+                sound(
+                    host,
+                    level,
+                    &config,
+                    step_sound(l),
+                    at,
+                    0.7,
+                    0.9 + 0.2 * k as f64,
+                );
             }
         }
         let key = (r.dim.clone(), base);
@@ -2202,18 +2605,18 @@ fn tick_shakes(game: &mut Game<'_>, st: &mut State, dim: &str) {
         let rolls = (tree.leaves.len() / 4).clamp(2, 12);
         for _ in 0..rolls {
             let leaf = tree.leaves[st.rng.below(tree.leaves.len() as u32) as usize];
-            let Some(id) = state_at(game, leaf) else {
+            let Some(id) = state_at(host, level, leaf) else {
                 continue;
             };
-            if !in_tag(game, id, "minecraft:leaves") {
+            if !in_tag(host, id, "minecraft:leaves") {
                 continue;
             }
             let at = [0, 1, 2].map(|i| f64::from(leaf[i]) + 0.5 - if i == 1 { 0.6 } else { 0.0 });
-            for item in game.block_loot_at(leaf, id, None) {
-                if item.item.ends_with("_leaves") {
+            for item in loot_at(host, level, leaf, None) {
+                if item.item().id(host).ends_with("_leaves") {
                     continue;
                 }
-                drop_item(game, &mut st.rng, at, item, None);
+                drop_item(host, level, &mut st.rng, at, item, None);
             }
         }
     }
@@ -2221,7 +2624,7 @@ fn tick_shakes(game: &mut Game<'_>, st: &mut State, dim: &str) {
 
 /// What a log that starts to tremble shows.
 struct TrembleSetup {
-    display: u32,
+    display: DisplayRef,
     leaves: Vec<Pos>,
     tint: Option<u32>,
     preview: Vec<[f64; 3]>,
@@ -2230,19 +2633,24 @@ struct TrembleSetup {
 /// A dig that just started (or a tree shaken): if its digger may fell the tree
 /// behind the log, the log's trembling display, some of the tree's lowest leaves,
 /// their tint and, for a dig, where the trunk will lie.
-fn tremble_start(game: &mut Game<'_>, st: &State, i: usize) -> Option<TrembleSetup> {
+fn tremble_start(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    st: &State,
+    i: usize,
+) -> Option<TrembleSetup> {
     let t = &st.trembles[i];
     let config = st.config.clone();
-    let who = cutter(game, t.player)?;
+    let who = cutter(host, t.player)?;
     if who.dim != t.dim || (!t.shaking && who.game_mode == 1) {
         return None;
     }
     if !t.shaking {
-        let axe = who.held.as_ref().is_some_and(|s| {
-            game.native_server_item_in_tag(s, "minecraft:axes")
-                .unwrap_or(false)
-        });
-        if !core::fells(&config, who.game_mode, who.sneaking, axe) {
+        let axe = who
+            .held
+            .as_ref()
+            .is_some_and(|s| item_in_tag(host, s, "minecraft:axes"));
+        if !rules::fells(&config, who.game_mode, who.sneaking, axe) {
             return None;
         }
     }
@@ -2250,15 +2658,15 @@ fn tremble_start(game: &mut Game<'_>, st: &State, i: usize) -> Option<TrembleSet
         let placed = st.placed.get(&t.dim);
         let protect = config.on(Key::Protect);
         let is_placed = |q: Pos| protect && placed.is_some_and(|set| set.contains(&q));
-        let mut reader = Reader::new(game, &config);
-        let wood = reader.wood(&name_of(game, t.state));
-        let mut look = core::Look::new(&mut reader);
-        let tree = core::scan(
+        let mut reader = Reader::new(host, level, &config);
+        let wood = reader.wood(&name_of(host, t.state));
+        let mut look = rules::Look::new(&mut reader);
+        let tree = rules::scan(
             &mut look,
             &is_placed,
             t.pos,
             wood,
-            &core::Limits::of(&config),
+            &rules::Limits::of(&config),
         )
         .ok()?;
         drop(look);
@@ -2270,9 +2678,9 @@ fn tremble_start(game: &mut Game<'_>, st: &State, i: usize) -> Option<TrembleSet
                 inner: &mut reader,
                 hole: t.pos,
             };
-            let mut look = core::Look::new(&mut holed);
-            let sink = core::gap(&mut look, &tree);
-            let dir = core::choose_dir(
+            let mut look = rules::Look::new(&mut holed);
+            let sink = rules::gap(&mut look, &tree);
+            let dir = rules::choose_dir(
                 &tree,
                 &mut look,
                 f64::from(who.yaw),
@@ -2280,18 +2688,18 @@ fn tremble_start(game: &mut Game<'_>, st: &State, i: usize) -> Option<TrembleSet
                 config.get(Key::Cone),
                 sink,
             );
-            let body = core::Body::new(&tree, dir, sink);
+            let body = rules::Body::new(&tree, dir, sink);
             let stop = body.contact(&mut look, true).theta;
             let mut seen = HashSet::new();
-            for (k, part) in body.parts.iter().enumerate().filter(|(_, p)| !p.leaf) {
+            for (k, _) in body.parts.iter().enumerate().filter(|(_, p)| !p.leaf) {
                 let c = body.center(k, stop);
                 let cell = [c[0].floor() as i32, c[2].floor() as i32];
                 if seen.insert(cell)
-                    && let Some(y) = ground_under(game, [cell[0], c[1].floor() as i32 + 1, cell[1]])
+                    && let Some(y) =
+                        ground_under(host, level, [cell[0], c[1].floor() as i32 + 1, cell[1]])
                 {
                     preview.push([c[0], y, c[2]]);
                 }
-                let _ = part;
             }
         }
         (tree, preview)
@@ -2302,14 +2710,14 @@ fn tremble_start(game: &mut Game<'_>, st: &State, i: usize) -> Option<TrembleSet
     let leaf = tree
         .leaves
         .first()
-        .and_then(|p| state_at(game, *p))
-        .map(|id| name_of(game, id));
-    let tint = tint_for(game, leaf.as_deref(), t.pos);
+        .and_then(|p| state_at(host, level, *p))
+        .map(|id| name_of(host, id));
+    let tint = tint_for(host, level, leaf.as_deref(), t.pos);
     // the display stands in the cell in front of the face dug, so it is lit as
     // that side is
     let anchor = [0, 1, 2].map(|k| f64::from(t.pos[k] + t.face[k]) + 0.5);
-    let (tr, scale) = core::tremble_pose(0, 0.0, t.face);
-    let display = summon_display(game, &t.dim, anchor, t.state, tr, scale, st.session, 0)?;
+    let (tr, scale) = rules::tremble_pose(0, 0.0, t.face);
+    let display = summon_display(host, &t.dim, anchor, t.state, tr, scale, st.session, 0)?;
     Some(TrembleSetup {
         display,
         leaves,
@@ -2319,34 +2727,35 @@ fn tremble_start(game: &mut Game<'_>, st: &State, i: usize) -> Option<TrembleSet
 }
 
 /// The level with one cell open: the log being dug, as it will be once broken.
-struct Holed<'r, 'g, 'a> {
-    inner: &'r mut Reader<'g, 'a>,
+struct Holed<'r, 'g> {
+    inner: &'r mut Reader<'g>,
     hole: Pos,
 }
 
-impl core::World for Holed<'_, '_, '_> {
+impl rules::World for Holed<'_, '_> {
     fn cell(&mut self, p: Pos) -> Option<Cell> {
         if p == self.hole {
             return Some(Cell::Open);
         }
-        core::World::cell(self.inner, p)
+        rules::World::cell(self.inner, p)
     }
 }
 
 /// Whether the cell at `p` is open (air, plants).
-fn look_is_open(game: &Game<'_>, p: Pos) -> bool {
-    state_at(game, p).is_some_and(|id| {
-        let b = game.res.behaviours();
-        b.is_air(id) || b.is_replaceable(id) || b.collision_shape(id).is_some_and(|s| s.is_empty())
+fn look_is_open(host: &dyn Host, level: LevelRef, p: Pos) -> bool {
+    state_at(host, level, p).is_some_and(|id| {
+        is_air(&name_of(host, id))
+            || host.block_states().replaceable(id) == Some(true)
+            || collision(host, level, id, p).is_some_and(|s| s.is_empty())
     })
 }
 
 /// The top of the ground under `p` (searching six blocks down): just above the
 /// first block something can stand on.
-fn ground_under(game: &Game<'_>, p: Pos) -> Option<f64> {
+fn ground_under(host: &dyn Host, level: LevelRef, p: Pos) -> Option<f64> {
     for dy in 0..8 {
         let q = [p[0], p[1] - dy, p[2]];
-        if !look_is_open(game, q) && state_at(game, q).is_some() {
+        if !look_is_open(host, level, q) && state_at(host, level, q).is_some() {
             return Some(f64::from(q[1]) + 1.05);
         }
     }
@@ -2372,17 +2781,17 @@ struct Knock {
 }
 
 /// The lowest log of the trunk `cell` is in (same kind of log all the way down).
-fn trunk_base(game: &Game<'_>, cell: Pos) -> Option<(Pos, BlockStateId)> {
-    let id = state_at(game, cell)?;
-    if !is_trunk(game, id) {
+fn trunk_base(host: &dyn Host, level: LevelRef, cell: Pos) -> Option<(Pos, BlockState)> {
+    let id = state_at(host, level, cell)?;
+    if !is_trunk(host, id) {
         return None;
     }
-    let kind = species(&name_of(game, id)).to_owned();
+    let kind = species(&name_of(host, id)).to_owned();
     let mut base = (cell, id);
     for _ in 0..64 {
         let below = [base.0[0], base.0[1] - 1, base.0[2]];
-        match state_at(game, below) {
-            Some(b) if is_trunk(game, b) && species(&name_of(game, b)) == kind => {
+        match state_at(host, level, below) {
+            Some(b) if is_trunk(host, b) && species(&name_of(host, b)) == kind => {
                 base = (below, b);
             }
             _ => break,
@@ -2393,12 +2802,12 @@ fn trunk_base(game: &Game<'_>, cell: Pos) -> Option<(Pos, BlockStateId)> {
 
 /// Each tree whose trunk was hit falls in turn, the way it was pushed; the tree
 /// that hit it, its way clear, falls on.
-fn chain(game: &mut Game<'_>, st: &mut State, dim: &str, k: Knock) {
+fn chain(host: &mut dyn ServerHost, level: LevelRef, st: &mut State, dim: &str, k: Knock) {
     let config = st.config.clone();
     let mut bases = HashSet::new();
     let mut felled = false;
     for cell in &k.cells {
-        let Some((base, state)) = trunk_base(game, *cell) else {
+        let Some((base, state)) = trunk_base(host, level, *cell) else {
             continue;
         };
         if !bases.insert(base) {
@@ -2408,7 +2817,7 @@ fn chain(game: &mut Game<'_>, st: &mut State, dim: &str, k: Knock) {
             dim: dim.to_owned(),
             cut: base,
             cut_state: state,
-            yaw: core::dir_yaw(k.dir),
+            yaw: rules::dir_yaw(k.dir),
             aim: true,
             cone: 20,
             tool: k.tool.clone(),
@@ -2422,7 +2831,7 @@ fn chain(game: &mut Game<'_>, st: &mut State, dim: &str, k: Knock) {
             generation: k.generation,
             standing: true,
         };
-        if fell_tree(game, st, start) {
+        if fell_tree(host, level, st, start) {
             felled = true;
         }
     }
@@ -2430,13 +2839,22 @@ fn chain(game: &mut Game<'_>, st: &mut State, dim: &str, k: Knock) {
         return;
     }
     // bonk!
-    sound(game, &config, "minecraft:block.wood.hit", k.at, 1.0, 0.7);
-    sound(game, &config, CRACK, k.at, 0.7, 0.8);
-    sound(game, &config, PLOP, k.at, 0.7, 0.7);
-    particles(
-        game,
+    sound(
+        host,
+        level,
         &config,
-        ParticleOptions::simple(ParticleType::Crit),
+        "minecraft:block.wood.hit",
+        k.at,
+        1.0,
+        0.7,
+    );
+    sound(host, level, &config, CRACK, k.at, 0.7, 0.8);
+    sound(host, level, &config, PLOP, k.at, 0.7, 0.7);
+    particles(
+        host,
+        level,
+        &config,
+        Fx::Crit,
         None,
         k.at,
         [0.3, 0.3, 0.3],
@@ -2447,14 +2865,14 @@ fn chain(game: &mut Game<'_>, st: &mut State, dim: &str, k: Knock) {
         return;
     };
     let (contact, crush, hits) = {
-        let mut reader = Reader::new(game, &config);
-        let mut look = core::Look::new(&mut reader);
+        let mut reader = Reader::new(host, level, &config);
+        let mut look = rules::Look::new(&mut reader);
         let contact = t.fell.body.contact(&mut look, true);
         let crush = t.fell.body.crush(&mut look, contact.theta);
         let hits = log_hits(&mut look, &contact);
         (contact, crush, hits)
     };
-    t.contacts = dust_points(game, &contact);
+    t.contacts = dust_points(host, level, &contact);
     t.hits = hits;
     t.resumes += 1;
     t.settled = false;
@@ -2465,59 +2883,61 @@ fn chain(game: &mut Game<'_>, st: &mut State, dim: &str, k: Knock) {
 // A tick of a falling tree
 // ---------------------------------------------------------------------------------
 
-/// Moves `t` a tick in the level in place: whether it is done, and the trees its
+/// Moves `t` a tick in its level (in place): whether it is done, and the trees its
 /// trunk knocks into.
 fn tick_tree(
-    game: &mut Game<'_>,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
     config: &Config,
-    rng: &mut core::Rng,
+    rng: &mut rules::Rng,
     t: &mut Falling,
 ) -> (bool, Option<Knock>) {
     let was_falling = t.fell.phase == Phase::Falling;
     let frame = t.fell.tick();
     let theta = frame.theta;
-    play_later(game, config, t);
+    play_later(host, level, config, t);
 
     // the log that trembled as it was dug pops
     if let Some(id) = t.ghost.take() {
-        game.native_remove_entity(&t.dim, id);
+        remove(host, id);
         let at = t.anchor;
-        block_bits(game, config, t.cut_state, at, 10.0);
+        block_bits(host, level, config, t.cut_state, at, 10.0);
         particles(
-            game,
+            host,
+            level,
             config,
-            ParticleOptions::simple(ParticleType::Poof),
+            Fx::Poof,
             None,
             at,
             [0.2, 0.2, 0.2],
             0.04,
             5.0,
         );
-        sound(game, config, PLOP, at, 0.8, 1.3);
-        sound(game, config, BUBBLE, at, 0.7, 1.2);
-        sound(game, config, CRACK, at, 0.5, 1.2);
+        sound(host, level, config, PLOP, at, 0.8, 1.3);
+        sound(host, level, config, BUBBLE, at, 0.7, 1.2);
+        sound(host, level, config, CRACK, at, 0.5, 1.2);
     }
 
-    let body = &t.fell.body;
     if frame.moved {
-        let q = body.quat(theta);
-        for i in t.fell.remaining() {
-            if let Some(id) = t.ents[i] {
-                pose(
-                    game,
-                    id,
-                    body.translation(body.parts[i].cell, theta, t.anchor),
-                    q,
-                );
+        let q = t.fell.body.quat(theta);
+        let remaining: Vec<usize> = t.fell.remaining().collect();
+        for i in remaining {
+            if let Some(d) = t.ents[i] {
+                let tr = t
+                    .fell
+                    .body
+                    .translation(t.fell.body.parts[i].cell, theta, t.anchor);
+                pose(host, d, tr, q, 1.0);
             }
         }
     }
     if frame.landed.is_some() {
         // down on the stump: pomf
+        let body = &t.fell.body;
         let at = [body.pivot[0], body.pivot[1] - body.sink, body.pivot[2]];
-        sound(game, config, WOOL, at, 0.9, 0.75);
-        sound(game, config, THUD, at, 0.5, 0.8);
-        block_bits(game, config, t.cut_state, at, 6.0);
+        sound(host, level, config, WOOL, at, 0.9, 0.75);
+        sound(host, level, config, THUD, at, 0.5, 0.8);
+        block_bits(host, level, config, t.cut_state, at, 6.0);
     }
     if !t.creaked && t.fell.phase == Phase::Falling {
         // it starts to go: the fibres crack and the trunk groans
@@ -2529,17 +2949,26 @@ fn tick_tree(
             body.pivot[2],
         ];
         let mid = body.center(t.middle, theta);
-        sound(game, config, CRACK, base, 0.7, 0.65);
-        sound(game, config, CREAK, mid, 0.7, 0.55);
+        sound(host, level, config, CRACK, base, 0.7, 0.65);
+        sound(host, level, config, CREAK, mid, 0.7, 0.55);
         let now = t.fell.age;
         t.later.push((now + 7, CREAK, mid, 0.5, 0.5));
         t.creak_age = Some(now);
         // a big tree's birds take off
         if config.on(Key::Birds) && t.leaves.len() >= 25 {
             let crown = t.fell.body.center(t.tip, theta);
-            sound(game, config, "minecraft:entity.parrot.fly", crown, 0.7, 1.1);
             sound(
-                game,
+                host,
+                level,
+                config,
+                "minecraft:entity.parrot.fly",
+                crown,
+                0.7,
+                1.1,
+            );
+            sound(
+                host,
+                level,
                 config,
                 "minecraft:entity.parrot.ambient",
                 crown,
@@ -2551,9 +2980,10 @@ fn tick_tree(
             t.later
                 .push((now + 5, "minecraft:entity.parrot.fly", crown, 0.5, 1.3));
             particles(
-                game,
+                host,
+                level,
                 config,
-                ParticleOptions::simple(ParticleType::Cloud),
+                Fx::Cloud,
                 None,
                 [crown[0], crown[1] + 1.0, crown[2]],
                 [1.2, 0.4, 1.2],
@@ -2574,10 +3004,10 @@ fn tick_tree(
             if lying || now >= start + t.apples[k].2 {
                 let (i, apple, _) = t.apples.remove(k);
                 let at = t.fell.body.center(i, theta);
-                drop_item(game, rng, at, apple, t.owner);
+                drop_item(host, level, rng, at, apple, t.owner);
                 if !plopped {
                     plopped = true;
-                    sound(game, config, PLOP, at, 0.3, 1.5);
+                    sound(host, level, config, PLOP, at, 0.3, 1.5);
                 }
             } else {
                 k += 1;
@@ -2585,12 +3015,12 @@ fn tick_tree(
         }
     }
     if was_falling {
-        falling_effects(game, config, t);
-        strike(game, config, t);
+        falling_effects(host, level, config, t);
+        strike(host, level, config, t);
     }
     let mut knock = None;
     if let Some(impact) = frame.impact {
-        impact_effects(game, config, rng, t, impact);
+        impact_effects(host, level, config, rng, t, impact);
         let tip_speed = impact.omega.abs() * t.fell.body.reach;
         if impact.first
             && impact.ground
@@ -2615,21 +3045,24 @@ fn tick_tree(
         }
     }
     if was_falling && t.fell.phase != Phase::Falling && !t.settled {
-        settle(game, t);
+        // its displays hold their last pose: the server keeps it, so players who
+        // come later see it lying where it lies
+        t.settled = true;
     }
 
     // leaves crushed under the trunk
     let mut squished = false;
     for i in frame.crushed {
         let at = t.fell.body.center(i, theta);
-        if let Some(id) = t.ents[i].take() {
-            game.native_remove_entity(&t.dim, id);
+        if let Some(d) = t.ents[i].take() {
+            remove(host, d);
         }
-        block_bits(game, config, t.states[i], at, 4.0);
+        block_bits(host, level, config, t.states[i], at, 4.0);
         if !squished {
             squished = true;
             sound(
-                game,
+                host,
+                level,
                 config,
                 "minecraft:block.moss_carpet.place",
                 at,
@@ -2637,27 +3070,26 @@ fn tick_tree(
                 1.2,
             );
             if let Some(l) = &t.leaf {
-                sound(game, config, break_sound(l), at, 0.4, 1.3);
+                sound(host, level, config, break_sound(l), at, 0.4, 1.3);
             }
         }
         for item in std::mem::take(&mut t.loot[i]) {
-            drop_item(game, rng, at, item, t.owner);
+            drop_item(host, level, rng, at, item, t.owner);
         }
     }
 
     if matches!(t.fell.phase, Phase::Lying(_) | Phase::Breaking)
         && config.on(Key::Leaves)
-        && t.fell.age % 3 == 0
+        && t.fell.age.is_multiple_of(3)
     {
-        twirl(game, config, rng, t);
+        twirl(host, level, config, rng, t);
     }
 
     // from the base up, each block puffs up and pops
-    let body = &t.fell.body;
     for &(i, scale, lift) in &frame.popping {
-        if let Some(id) = t.ents[i] {
-            let (tr, q) = body.pose(i, theta, t.anchor, scale, lift);
-            pose_scaled(game, id, tr, q, scale as f32);
+        if let Some(d) = t.ents[i] {
+            let (tr, q) = t.fell.body.pose(i, theta, t.anchor, scale, lift);
+            pose(host, d, tr, q, scale as f32);
         }
     }
     if let Some(n) = frame.note
@@ -2665,11 +3097,12 @@ fn tick_tree(
     {
         // the pops rise in pitch as the breaking climbs
         let at = t.fell.body.center(i, theta);
-        sound(game, config, BUBBLE, at, 0.5, 0.75 + 0.07 * n as f64);
+        sound(host, level, config, BUBBLE, at, 0.5, 0.75 + 0.07 * n as f64);
         particles(
-            game,
+            host,
+            level,
             config,
-            ParticleOptions::simple(ParticleType::HappyVillager),
+            Fx::HappyVillager,
             None,
             [at[0], at[1] + 0.5, at[2]],
             [0.3, 0.2, 0.3],
@@ -2680,14 +3113,15 @@ fn tick_tree(
     let mut plops = 0;
     for i in frame.broke {
         let at = t.fell.body.center(i, theta);
-        if let Some(id) = t.ents[i].take() {
-            game.native_remove_entity(&t.dim, id);
+        if let Some(d) = t.ents[i].take() {
+            remove(host, d);
         }
-        block_bits(game, config, t.states[i], at, 3.0);
+        block_bits(host, level, config, t.states[i], at, 3.0);
         particles(
-            game,
+            host,
+            level,
             config,
-            ParticleOptions::simple(ParticleType::Poof),
+            Fx::Poof,
             None,
             at,
             [0.15, 0.15, 0.15],
@@ -2696,33 +3130,42 @@ fn tick_tree(
         );
         if plops < 1 {
             plops += 1;
-            sound(game, config, PLOP, at, 0.3, 1.2 + rng.unit() * 0.4);
+            sound(host, level, config, PLOP, at, 0.3, 1.2 + rng.unit() * 0.4);
         }
         for item in std::mem::take(&mut t.loot[i]) {
-            drop_item(game, rng, at, item, t.owner);
+            drop_item(host, level, rng, at, item, t.owner);
         }
     }
     if frame.done {
         for (i, apple, _) in std::mem::take(&mut t.apples) {
             let at = t.fell.body.center(i, theta);
-            drop_item(game, rng, at, apple, t.owner);
+            drop_item(host, level, rng, at, apple, t.owner);
         }
     }
     if frame.done
         && let Some((sapling, spots, from_loot)) = t.replant.take()
     {
-        replant(game, config, rng, &t.dim, sapling, &spots, from_loot);
+        replant(host, level, config, rng, sapling, &spots, from_loot);
     }
     if frame.done {
         // all gone: a last pop and a few hearts where the crown was
         let at = t.fell.body.center(t.tip, theta);
-        sound(game, config, PLOP, at, 0.7, 1.0);
-        sound(game, config, BUBBLE, at, 0.6, 1.5);
-        sound(game, config, "minecraft:entity.item.pickup", at, 0.4, 1.6);
-        particles(
-            game,
+        sound(host, level, config, PLOP, at, 0.7, 1.0);
+        sound(host, level, config, BUBBLE, at, 0.6, 1.5);
+        sound(
+            host,
+            level,
             config,
-            ParticleOptions::simple(ParticleType::Heart),
+            "minecraft:entity.item.pickup",
+            at,
+            0.4,
+            1.6,
+        );
+        particles(
+            host,
+            level,
+            config,
+            Fx::Heart,
             None,
             [at[0], at[1] + 0.5, at[2]],
             [0.6, 0.3, 0.6],
@@ -2734,54 +3177,36 @@ fn tick_tree(
 }
 
 /// The sounds whose tick has come.
-fn play_later(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
+fn play_later(host: &mut dyn ServerHost, level: LevelRef, config: &Config, t: &mut Falling) {
     let now = t.fell.age;
     let mut i = 0;
     while i < t.later.len() {
         if t.later[i].0 <= now {
             let (_, name, at, volume, pitch) = t.later.remove(i);
-            sound(game, config, name, at, volume, pitch);
+            sound(host, level, config, name, at, volume, pitch);
         } else {
             i += 1;
         }
     }
 }
 
-/// The displays' final pose kept by the server, so players who come later see the
-/// tree lying where it lies.
-fn settle(game: &mut Game<'_>, t: &mut Falling) {
-    t.settled = true;
-    let theta = t.fell.theta();
-    let body = &t.fell.body;
-    let q = body.quat(theta);
-    for i in t.fell.remaining() {
-        if let Some(id) = t.ents[i] {
-            let d = NativeDisplay {
-                translation: body.translation(body.parts[i].cell, theta, t.anchor),
-                left_rotation: q,
-                ..NativeDisplay::default()
-            };
-            game.native_set_display(&t.dim, id, &d);
-        }
-    }
-}
-
 /// The crown rustles as it gathers speed, and flutters once it is fast.
-fn falling_effects(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
+fn falling_effects(host: &mut dyn ServerHost, level: LevelRef, config: &Config, t: &mut Falling) {
     let body = &t.fell.body;
     let tip_speed = t.fell.motion.omega.abs() * body.reach;
     let crown = body.center(t.tip, t.fell.theta());
     if let Some(leaf) = &t.leaf
         && tip_speed > 3.0
-        && t.fell.age % 4 == 0
+        && t.fell.age.is_multiple_of(4)
     {
         let v = (tip_speed / 14.0).clamp(0.2, 0.7);
-        sound(game, config, step_sound(leaf), crown, v, 0.8);
+        sound(host, level, config, step_sound(leaf), crown, v, 0.8);
     }
     if !t.whoosh && tip_speed > 6.0 {
         t.whoosh = true;
         sound(
-            game,
+            host,
+            level,
             config,
             "minecraft:entity.parrot.fly",
             crown,
@@ -2789,7 +3214,8 @@ fn falling_effects(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
             0.75,
         );
         sound(
-            game,
+            host,
+            level,
             config,
             "minecraft:entity.player.attack.sweep",
             crown,
@@ -2802,11 +3228,12 @@ fn falling_effects(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
 /// The ground takes it softly: a deep pomf and a squish, then a little rising
 /// arpeggio; the soil's dust and a burst of leaves. A bounce is a boing.
 fn impact_effects(
-    game: &mut Game<'_>,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
     config: &Config,
-    rng: &mut core::Rng,
+    rng: &mut rules::Rng,
     t: &mut Falling,
-    impact: core::Impact,
+    impact: rules::Impact,
 ) {
     if !impact.ground {
         return;
@@ -2821,11 +3248,11 @@ fn impact_effects(
         // a deep wooden thud as big as the tree, softened, branches snapping and
         // the crown crashing, then a few bubbly pops
         let deep = (0.75 - logs * 0.008).clamp(0.5, 0.75);
-        sound(game, config, THUD, mid, 1.0 * speed, deep);
-        sound(game, config, WOOL, mid, 1.0 * speed, 0.6);
-        sound(game, config, CRACK, mid, 0.7, 0.6);
+        sound(host, level, config, THUD, mid, 1.0 * speed, deep);
+        sound(host, level, config, WOOL, mid, 1.0 * speed, 0.6);
+        sound(host, level, config, CRACK, mid, 0.7, 0.6);
         if let Some(l) = &t.leaf {
-            sound(game, config, break_sound(l), crown, 0.9, 0.8);
+            sound(host, level, config, break_sound(l), crown, 0.9, 0.8);
         }
         let now = t.fell.age;
         for (k, pitch) in [(2, 1.0), (3, 1.25), (5, 1.45)] {
@@ -2833,17 +3260,26 @@ fn impact_effects(
         }
     } else {
         // a bounce: a lighter thud and a little pop
-        sound(game, config, THUD, mid, 0.4 + 0.3 * speed, 1.0);
-        sound(game, config, "minecraft:block.wool.step", mid, 0.6, 0.9);
-        sound(game, config, BUBBLE, mid, 0.3, 1.3);
+        sound(host, level, config, THUD, mid, 0.4 + 0.3 * speed, 1.0);
+        sound(
+            host,
+            level,
+            config,
+            "minecraft:block.wool.step",
+            mid,
+            0.6,
+            0.9,
+        );
+        sound(host, level, config, BUBBLE, mid, 0.3, 1.3);
     }
     if config.on(Key::Dust) {
         let k = if impact.first { 1.0 } else { 0.35 };
         for (at, ground) in t.contacts.clone() {
             particles(
-                game,
+                host,
+                level,
                 config,
-                ParticleOptions::simple(ParticleType::DustPillar),
+                Fx::DustPillar,
                 Some(ground),
                 at,
                 [0.3, 0.05, 0.3],
@@ -2851,9 +3287,10 @@ fn impact_effects(
                 5.0 * k * speed,
             );
             particles(
-                game,
+                host,
+                level,
                 config,
-                ParticleOptions::simple(ParticleType::Block),
+                Fx::Block,
                 Some(ground),
                 at,
                 [0.45, 0.1, 0.45],
@@ -2862,9 +3299,10 @@ fn impact_effects(
             );
             if impact.first {
                 particles(
-                    game,
+                    host,
+                    level,
                     config,
-                    ParticleOptions::simple(ParticleType::Poof),
+                    Fx::Poof,
                     None,
                     at,
                     [0.3, 0.1, 0.3],
@@ -2887,15 +3325,31 @@ fn impact_effects(
         for _ in 0..10.min(alive.len()) {
             let i = alive[rng.below(alive.len() as u32) as usize];
             let at = t.fell.body.center(i, theta);
-            if let Some(o) = leaf_particle(&l, t.tint) {
-                particles(game, config, o, None, at, [0.5, 0.4, 0.5], 0.03, 3.0);
+            if let Some(fx) = leaf_particle(&l, t.tint) {
+                particles(
+                    host,
+                    level,
+                    config,
+                    fx,
+                    None,
+                    at,
+                    [0.5, 0.4, 0.5],
+                    0.03,
+                    3.0,
+                );
             }
         }
     }
 }
 
 /// Leaves drift down from the crown while it lies there.
-fn twirl(game: &mut Game<'_>, config: &Config, rng: &mut core::Rng, t: &Falling) {
+fn twirl(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    config: &Config,
+    rng: &mut rules::Rng,
+    t: &Falling,
+) {
     let Some(l) = &t.leaf else {
         return;
     };
@@ -2912,15 +3366,15 @@ fn twirl(game: &mut Game<'_>, config: &Config, rng: &mut core::Rng, t: &Falling)
         let i = alive[rng.below(alive.len() as u32) as usize];
         let mut at = t.fell.body.center(i, t.fell.theta());
         at[1] += 0.4;
-        if let Some(o) = leaf_particle(l, t.tint) {
-            particles(game, config, o, None, at, [0.4, 0.2, 0.4], 0.0, 1.0);
+        if let Some(fx) = leaf_particle(l, t.tint) {
+            particles(host, level, config, fx, None, at, [0.4, 0.2, 0.4], 0.0, 1.0);
         }
     }
 }
 
 /// What the falling tree comes down on: mobs and players allowed by the settings,
 /// hurt by how fast the block that meets them moves, and pushed along the fall.
-fn strike(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
+fn strike(host: &mut dyn ServerHost, level: LevelRef, config: &Config, t: &mut Falling) {
     let omega = t.fell.motion.omega;
     if !config.on(Key::Damage) || omega.abs() < 0.3 {
         return;
@@ -2940,26 +3394,31 @@ fn strike(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
         let felt = if leaf { speed * 0.3 } else { speed };
         (felt >= 2.0).then(|| (felt * 0.9).clamp(1.0, max) as f32)
     };
+    let lo = [pivot[0] - reach, pivot[1] - reach, pivot[2] - reach];
+    let hi = [pivot[0] + reach, pivot[1] + reach, pivot[2] + reach];
     // mobs
     let mut hits = Vec::new();
-    for m in game.mobs.iter() {
-        if m.removed || !m.alive() || t.struck.contains(&m.id) {
+    for e in level.entities_in(host, lo, hi).unwrap_or_default() {
+        if t.struck.contains(&e.id()) || host.mob(e).is_none() {
             continue;
         }
-        let pos = [m.position.x, m.position.y, m.position.z];
+        let Some(living) = host.living(e) else {
+            continue;
+        };
+        if living.alive(host) != Some(true) {
+            continue;
+        }
+        let Some(pos) = e.position(host) else {
+            continue;
+        };
         if !near(pos) {
             continue;
         }
-        let id = &m.kind.id;
-        let kind = if id.contains(':') {
-            id.to_string()
-        } else {
-            format!("minecraft:{id}")
-        };
-        let ally = m.extra.owner.is_some() || ALLIES.contains(&kind.as_str());
+        let kind = e.kind(host).map(|k| k.id(host)).unwrap_or_default();
+        let ally = living.owner(host).is_some() || ALLIES.contains(&kind.as_str());
         let allowed = if ally {
             config.on(Key::Allies)
-        } else if m.kind.category == "monster" {
+        } else if matches!(e.classification(host), Some(MobCategory::Monster)) {
             config.on(Key::Monsters)
         } else {
             config.on(Key::Animals)
@@ -2967,24 +3426,36 @@ fn strike(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
         if !allowed {
             continue;
         }
-        let hw = m.kind.width / 2.0;
-        let lo = [pos[0] - hw, pos[1], pos[2] - hw];
-        let hi = [pos[0] + hw, pos[1] + m.kind.height, pos[2] + hw];
+        let Some([lo, hi]) = e.bounding_box(host) else {
+            continue;
+        };
         if let Some(dmg) = harm(body.strike(theta, omega, lo, hi, &t.fell.alive)) {
-            hits.push((m.id, dmg, pos));
+            let resist = living
+                .attribute_value(host, "minecraft:knockback_resistance")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            hits.push((e, dmg, 0.4 * (1.0 - resist)));
         }
     }
-    for (id, dmg, pos) in hits {
-        t.struck.insert(id);
-        if let Some(m) = game.mobs.iter_mut().find(|m| m.id == id) {
-            m.damage(
-                dmg,
-                Damage {
-                    kind: DamageKind::FallingBlock,
-                    attacker: None,
-                    from: Some([pos[0] - dir[0], pos[1], pos[2] - dir[1]]),
-                },
-            );
+    for (e, dmg, strength) in hits {
+        t.struck.insert(e.id());
+        let before = e.velocity(host);
+        let on_ground = e.on_ground(host).unwrap_or(false);
+        // hurt by a falling block, then knocked back the way the tree falls: vanilla's
+        // knockback (`LivingEntity.knockback`) from a hit just behind it, which
+        // replaces whatever way the hurt itself pushed it
+        if e.hurt(host, "minecraft:falling_block", dmg, None, None) == Some(true)
+            && strength > 0.0
+            && let Some(v) = before
+        {
+            let len = dir[0].hypot(dir[1]).max(1e-9);
+            let k = [dir[0] / len * strength, dir[1] / len * strength];
+            let up = if on_ground {
+                (v[1] / 2.0 + strength).min(0.4)
+            } else {
+                v[1]
+            };
+            e.set_velocity(host, [v[0] / 2.0 + k[0], up, v[2] / 2.0 + k[1]]);
         }
     }
     // players
@@ -2992,25 +3463,38 @@ fn strike(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
         return;
     }
     let mut struck = Vec::new();
-    for p in game.native_server_players() {
-        if p.dimension != t.dim
-            || !(p.game_mode == 0 || p.game_mode == 2)
-            || p.health <= 0.0
-            || t.struck_players.contains(&p.uuid)
-            || !near(p.position)
+    for p in level.online_players(host).unwrap_or_default() {
+        if t.struck_players.contains(&p.uuid())
+            || !matches!(
+                p.game_mode(host),
+                Some(GameMode::Survival | GameMode::Adventure)
+            )
+            || !host
+                .living(p.entity())
+                .and_then(|l| l.health(host))
+                .is_some_and(|h| h > 0.0)
         {
             continue;
         }
-        let pos = p.position;
-        let lo = [pos[0] - 0.3, pos[1], pos[2] - 0.3];
-        let hi = [pos[0] + 0.3, pos[1] + 1.8, pos[2] + 0.3];
-        if let Some(dmg) = harm(body.strike(theta, omega, lo, hi, &t.fell.alive)) {
-            struck.push((p.uuid, p.name, dmg, pos));
+        let Some(pos) = p.entity().position(host) else {
+            continue;
+        };
+        if !near(pos) {
+            continue;
+        }
+        let [lo, hi] = p.entity().bounding_box(host).unwrap_or([
+            [pos[0] - 0.3, pos[1], pos[2] - 0.3],
+            [pos[0] + 0.3, pos[1] + 1.8, pos[2] + 0.3],
+        ]);
+        if let Some(dmg) = harm(body.strike(theta, omega, lo, hi, &t.fell.alive))
+            && let Some(name) = p.name(host)
+        {
+            struck.push((p.uuid(), name, dmg, pos));
         }
     }
     for (uuid, name, dmg, pos) in struck {
         t.struck_players.insert(uuid);
-        game.native_run_command(&format!(
+        host.commands().run_command(&format!(
             "damage {name} {dmg:.1} minecraft:falling_block at {} {} {}",
             pos[0] - dir[0],
             pos[1],
@@ -3019,14 +3503,68 @@ fn strike(game: &mut Game<'_>, config: &Config, t: &mut Falling) {
     }
 }
 
+/// `{"Item": ..., "PickupDelay": 10s}` as SNBT, for `summon minecraft:item`.
+fn snbt(tag: &Tag) -> String {
+    fn quoted(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
+    }
+    match tag {
+        Tag::End => String::new(),
+        Tag::Byte(v) => format!("{v}b"),
+        Tag::Short(v) => format!("{v}s"),
+        Tag::Int(v) => v.to_string(),
+        Tag::Long(v) => format!("{v}L"),
+        Tag::Float(v) => format!("{:?}f", f32::from_bits(*v)),
+        Tag::Double(v) => format!("{:?}d", f64::from_bits(*v)),
+        Tag::String(s) => quoted(&s.to_string_lossy()),
+        Tag::ByteArray(v) => format!(
+            "[B;{}]",
+            v.iter()
+                .map(|b| format!("{}b", *b as i8))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Tag::IntArray(v) => format!(
+            "[I;{}]",
+            v.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+        ),
+        Tag::LongArray(v) => format!(
+            "[L;{}]",
+            v.iter()
+                .map(|l| format!("{l}L"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Tag::List(items) => format!("[{}]", items.iter().map(snbt).collect::<Vec<_>>().join(",")),
+        Tag::Compound(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(k, v)| format!("{}:{}", quoted(&k.to_string_lossy()), snbt(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
 /// Ends a tree at once: its displays go and what it still holds drops where each
 /// block is. In the level in place it is done directly; elsewhere with commands.
-fn end_tree(game: &mut Game<'_>, t: &mut Falling) {
+fn end_tree(host: &mut dyn ServerHost, t: &mut Falling) {
     let theta = t.fell.theta();
-    let here = game.dim.id() == t.dim;
-    let mut rng = core::Rng::new(t.id ^ 0x5EED);
-    if here && let Some(id) = t.ghost.take() {
-        game.native_remove_entity(&t.dim, id);
+    let level = host.level(&t.dim).filter(|l| l.in_place(host));
+    let mut rng = rules::Rng::new(t.id ^ 0x5EED);
+    if let Some(id) = t.ghost.take()
+        && level.is_some()
+    {
+        remove(host, id);
     }
     for (i, apple, _) in std::mem::take(&mut t.apples) {
         t.loot[i].push(apple);
@@ -3037,47 +3575,42 @@ fn end_tree(game: &mut Game<'_>, t: &mut Falling) {
         t.fell.alive[i] = false;
         let at = t.fell.body.center(i, theta);
         let items = std::mem::take(&mut t.loot[i]);
-        if here {
-            if let Some(id) = t.ents[i].take() {
-                game.native_remove_entity(&t.dim, id);
+        if let Some(level) = level {
+            if let Some(d) = t.ents[i].take() {
+                remove(host, d);
             }
             for item in items {
-                drop_item(game, &mut rng, at, item, None);
+                drop_item(host, level, &mut rng, at, item, None);
             }
         } else {
             for item in items {
+                let Some(nbt) = item.to_nbt(host) else {
+                    continue;
+                };
                 let mut c = Compound::new();
-                c.insert("Item".into(), horizon_items::item_nbt::item_to_nbt(&item));
+                c.insert("Item".into(), Tag::Compound(nbt));
                 c.insert("PickupDelay".into(), Tag::Short(10));
-                let snbt = horizon_world::snbt_text::to_snbt(&Tag::Compound(c));
-                game.native_run_command(&format!(
+                let snbt = snbt(&Tag::Compound(c));
+                host.commands().run_command(&format!(
                     "execute in {} run summon minecraft:item {} {} {} {snbt}",
                     t.dim, at[0], at[1], at[2]
                 ));
             }
         }
     }
-    if !here {
-        game.native_run_command(&format!(
+    if level.is_none() {
+        host.commands().run_command(&format!(
             "execute in {} run kill @e[type=minecraft:block_display,tag=chop.t{}]",
             t.dim, t.id
         ));
     }
     if let Some((sapling, spots, from_loot)) = t.replant.take() {
-        if here {
+        if let Some(level) = level {
             let config = Config::default();
-            replant(
-                game,
-                &config,
-                &mut rng,
-                &t.dim.clone(),
-                sapling,
-                &spots,
-                from_loot,
-            );
+            replant(host, level, &config, &mut rng, sapling, &spots, from_loot);
         } else {
             for p in spots {
-                game.native_run_command(&format!(
+                host.commands().run_command(&format!(
                     "execute in {} run setblock {} {} {} {sapling} keep",
                     t.dim, p[0], p[1], p[2]
                 ));
@@ -3090,49 +3623,39 @@ fn end_tree(game: &mut Game<'_>, t: &mut Falling) {
 // /chop
 // ---------------------------------------------------------------------------------
 
-fn color(name: &str) -> u32 {
-    named_color(name).unwrap_or(0xFFFFFF)
+fn style(color: &str) -> TextStyle {
+    let mut s = TextStyle::default();
+    s.color = Some(color.to_owned());
+    s
 }
 
-fn span(text: &str, color_name: &str) -> Text {
-    Text::styled(text, Style::color(color(color_name)))
+fn span(text: &str, color: &str) -> Text {
+    Text::literal(text).with_style(style(color))
 }
 
-fn bold(text: &str, color_name: &str) -> Text {
-    Text::styled(
-        text,
-        Style {
-            bold: Some(true),
-            ..Style::color(color(color_name))
-        },
-    )
+fn bold(text: &str, color: &str) -> Text {
+    let mut s = style(color);
+    s.bold = Some(true);
+    Text::literal(text).with_style(s)
 }
 
 /// `label` that runs `command` when clicked, with `hint` on hover.
-fn button(label: &str, color_name: &str, hint: &str, command: &str) -> Text {
-    Text::styled(
-        label,
-        Style {
-            click: Some(ClickEvent::RunCommand(command.to_owned())),
-            hover: Some(Box::new(Text::literal(hint))),
-            ..Style::color(color(color_name))
-        },
-    )
+fn button(label: &str, color: &str, hint: &str, command: &str) -> Text {
+    let mut s = style(color);
+    s.click = Some(TextClick::RunCommand(command.to_owned()));
+    s.hover = Some(TextHover::Text(Box::new(Text::literal(hint))));
+    Text::literal(label).with_style(s)
 }
 
-fn hinted(text: &str, color_name: &str, hint: &str) -> Text {
-    Text::styled(
-        text,
-        Style {
-            hover: Some(Box::new(Text::literal(hint))),
-            ..Style::color(color(color_name))
-        },
-    )
+fn hinted(text: &str, color: &str, hint: &str) -> Text {
+    let mut s = style(color);
+    s.hover = Some(TextHover::Text(Box::new(Text::literal(hint))));
+    Text::literal(text).with_style(s)
 }
 
 /// `/chop` in every player's command tree. The settings are checked when run, so
 /// the owner of a single player world uses them without cheats.
-pub(super) fn register(commands: &mut Vec<NativeCommand>) {
+pub(crate) fn commands(commands: &mut Vec<Command>) {
     for usage in [
         "chop",
         "chop on",
@@ -3146,25 +3669,41 @@ pub(super) fn register(commands: &mut Vec<NativeCommand>) {
         "chop perso <option:word> <value:integer>",
         "chop stats",
     ] {
-        commands.push(NativeCommand::new(usage));
+        commands.push(Command::new(usage));
     }
 }
 
-/// `native_perform_command`: `/chop ...`.
-pub(super) fn perform(
-    game: &mut Game<'_>,
-    player: &NativeServerPlayer,
-    command: &str,
-    ran: &mut bool,
-) {
-    let words: Vec<&str> = command.split_whitespace().collect();
-    if words.first() != Some(&"chop") {
-        return;
+/// `run_mod_command`: `/chop ...`. Whether it was ours.
+pub(crate) fn perform(
+    host: &mut dyn ServerHost,
+    source: &CommandSource,
+    command: &CommandInvocation,
+) -> bool {
+    if command.literals.first().map(String::as_str) != Some("chop") {
+        return false;
     }
-    *ran = true;
-    let uuid = player.uuid;
-    let admin = player.permission >= 2 || owner(game, uuid);
-    let reply = with_state(game, |_, st| -> Vec<Text> {
+    let CommandSource::Player {
+        player, permission, ..
+    } = source
+    else {
+        let _ = host
+            .commands()
+            .feedback(span("🪓 Chop! se règle en jeu, par un joueur.", "red"));
+        return true;
+    };
+    // the words as typed: the literals, then the arguments in their order
+    let mut typed = command.literals.clone();
+    for argument in &command.arguments {
+        match &argument.value {
+            CommandArgumentValue::String(s) => typed.push(s.clone()),
+            CommandArgumentValue::Integer(v) => typed.push(v.to_string()),
+            _ => {}
+        }
+    }
+    let words: Vec<&str> = typed.iter().map(String::as_str).collect();
+    let uuid = player.uuid();
+    let admin = permission.level() >= 2 || owner(host, uuid);
+    let reply = with_state(host, |_, st| -> Vec<Text> {
         match words[1..] {
             [] | ["on"] | ["off"] => {
                 let off = match words.get(1) {
@@ -3239,8 +3778,9 @@ pub(super) fn perform(
     });
     let lines = reply.unwrap_or_else(|| vec![span("🪓 Chop! est occupé, réessaie.", "red")]);
     for line in lines {
-        game.native_feedback(line);
+        let _ = host.commands().feedback(line);
     }
+    true
 }
 
 fn toggled(off: bool) -> Text {
@@ -3299,7 +3839,7 @@ const PERSO_OPTS: [(&str, &str, i32, i32, Unit); 3] = [
         "Particules",
         3,
         1,
-        Unit::Choice(core::PARTICLES),
+        Unit::Choice(rules::PARTICLES),
     ),
     ("apercu", "Aperçu de la chute", 1, 1, Unit::Switch),
 ];
@@ -3430,7 +3970,7 @@ fn page(config: &Config, section: Section) -> Vec<Text> {
             "red",
         ));
     }
-    for o in core::OPTS.iter().filter(|o| o.section == section) {
+    for o in rules::OPTS.iter().filter(|o| o.section == section) {
         let v = config.get(o.key);
         let mut line = span("  ", "gray")
             .append(hinted(o.label, "gray", o.help))

@@ -1,2 +1,6 @@
-target/
-dist/
+/target
+/.horizon
+/rules/target
+# Cargo writes one when the mod builds: Chop! has no registry dependencies, so it only pins the
+# SDK's own crates, which the pinned build already decides.
+/Cargo.lock
