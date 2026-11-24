@@ -1265,7 +1265,7 @@ fn pose(
         translation,
         left_rotation: rotation,
         scale: [scale; 3],
-        right_rotation: [0.0, 0.0, 0.0, 1.0],
+        ..Transformation::IDENTITY
     };
     if display.set_transformation(host, t) {
         display.set_start_interpolation(host, 0);

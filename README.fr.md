@@ -241,11 +241,12 @@ règles (`src/rules.rs`) n'ont pas changé.
 
 - Les règles passent leurs 18 tests sur des mondes construits à la main
   (`cargo test --manifest-path rules/Cargo.toml`).
-- Le côté jeu compile, sans aucun avertissement de clippy, contre une copie des signatures de l'API de
-  mods écrite d'après les sources de la Nightly 2026-11-22 : le vrai SDK n'a pas pu être téléchargé là où
-  il a été écrit.
-- **Pas encore vérifié** : la compilation avec le vrai SDK (`cargo horizon-mod check`), et une partie dans
-  le jeu. D'ici là, considère la 1.1.0 comme non testée.
+- Chaque hook, événement, méthode, type et import utilisé par le côté jeu a été comparé aux sources du
+  SDK épinglé (la release signée `sdk-f1bb66f…`) : tout correspond. Il compile aussi, sans aucun
+  avertissement de clippy, contre une petite copie de ces déclarations.
+- **Pas encore vérifié** : une vraie compilation avec le SDK (`cargo horizon-mod check` ; les dépendances
+  crates.io de l'API n'ont pas pu être téléchargées là où il a été écrit), et une partie dans le jeu.
+  D'ici là, considère la 1.1.0 comme non testée.
 
 **La version 1.0.1, dans le vrai jeu.** Horizon a été lancé sans fenêtre, avec un rendu logiciel, sur la
 Nightly `c9d474d` avec les vraies données de Minecraft 26.3. Un joueur a été piloté par le mode agent
